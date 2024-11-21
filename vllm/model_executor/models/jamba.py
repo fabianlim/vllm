@@ -17,6 +17,7 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -157,6 +158,9 @@ class JambaAttentionDecoderLayer(nn.Module):
         self,
         config: JambaConfig,
         layer_idx: int,
+        attn_rotary_emb: int = 64,
+        rope_theta: float = 10000,
+        max_position_embeddings: int = 8192,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -180,6 +184,19 @@ class JambaAttentionDecoderLayer(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        self.rotary_emb = None
+        if attn_rotary_emb:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=attn_rotary_emb,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=None,
+                is_neox_style=True,
+            )
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -220,6 +237,8 @@ class JambaAttentionDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.rotary_emb:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
         return output
@@ -435,6 +454,7 @@ class JambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, mamba_cache_params,
                                    inputs_embeds)
+
         return hidden_states
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
