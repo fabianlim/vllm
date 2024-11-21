@@ -1,0 +1,289 @@
+import torch
+from torch import nn
+from torch.nn.parameter import Parameter
+
+from vllm.attention.backends.abstract import AttentionMetadata
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
+from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               MergedColumnParallelLinear,
+                                               RowParallelLinear)
+from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+    causal_conv1d_fn, causal_conv1d_update)
+from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+    selective_scan_fn, selective_state_update)
+from vllm.model_executor.models.mamba_cache import MambaCacheParams
+from vllm.model_executor.utils import set_weight_attrs
+
+# FIXME: 
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+
+
+# from vllm.model_executor.layers.layernorm import RMSNorm
+
+from typing import Optional, Tuple, Union
+from vllm.model_executor.custom_op import CustomOp
+
+
+# FIMX:
+# vllm.model_executor.layers.layernorm import RMSNorm
+# Taken from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
+@CustomOp.register("jamba_gated_rms_norm")
+class JambaMambaRMSNormGated(CustomOp):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.variance_epsilon = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+    ):
+        pass
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
+        from vllm import _custom_ops as ops
+
+        # the original code casted gate to float32 before silu
+        out = torch.empty_like(x)
+        ops.rms_norm(
+            out,
+            x * nn.functional.silu(gate),
+            self.weight.data,
+            self.variance_epsilon,
+        )
+        return out
+
+    # def forward(self, hidden_states, gate=None):
+    #     input_dtype = hidden_states.dtype
+    #     hidden_states = hidden_states.to(torch.float32)
+
+    #     if gate is not None:
+    #         hidden_states = hidden_states * nn.functional.silu(gate.to(torch.float32))
+    #     variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    #     hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+
+    #     return self.weight * hidden_states.to(input_dtype)
+
+
+# Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
+@CustomOp.register("mamba_mixer2") 
+class MambaMixer2(CustomOp):
+    """
+    Compute ∆, A, B, C, and D the state space parameters and compute
+    the `contextualized_states`. A, D are input independent
+    (see Mamba paper [1] Section 3.5.2 "Interpretation of A"
+    for why A isn't selective) ∆, B, C are input-dependent
+    (this is a key difference between Mamba and the linear time
+    invariant S4, and is why Mamba is called
+    **selective** state spaces)
+    """
+
+    def __init__(self,
+                 hidden_size: int,
+                 ssm_state_size: int,
+                 conv_kernel_size: int,
+                 intermediate_size: int,
+                 time_step_rank: int,
+                 use_conv_bias: bool,
+                 use_bias: bool,
+                 use_rms_norm: bool,
+                 n_groups: int = 1,
+                 num_heads: int = 128,
+                 head_dim: int = 64,
+                 rms_norm_eps: float = 1e-5,
+                 activation="silu"):
+        super().__init__()
+        self.time_step_rank = time_step_rank
+        self.ssm_state_size = ssm_state_size
+        self.use_rms_norm = use_rms_norm
+        self.activation = activation
+
+        self.chunk_size = 256
+        self.intermediate_size = intermediate_size
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.n_groups = n_groups
+        self.conv_dim = intermediate_size + 2 * n_groups * ssm_state_size
+        self.conv1d = ColumnParallelLinear(
+            input_size=conv_kernel_size,
+            output_size=self.conv_dim,
+            bias=use_conv_bias,
+        )
+        # unsqueeze to fit conv1d weights shape into the linear weights shape.
+        # Can't do this in `weight_loader` since it already exists in
+        # `ColumnParallelLinear` and `set_weight_attrs`
+        # doesn't allow to override it
+        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
+
+        self.in_proj = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=intermediate_size + self.conv_dim + self.num_heads,
+            bias=use_bias
+        )
+
+        def A_weight_loader(param: Parameter, loaded_weight: torch.Tensor):
+            param.data.copy_(-torch.exp(loaded_weight.float()))
+
+        self.A = nn.Parameter(
+            torch.empty(
+                num_heads,
+                dtype=torch.float32,
+            ))
+        self.dt_bias = nn.Parameter(torch.ones(num_heads))
+        self.D = nn.Parameter(torch.ones(num_heads))
+
+        # set_weight_attrs(self.D, {"weight_loader": weight_loader})
+        set_weight_attrs(self.A, {"weight_loader": A_weight_loader})
+
+        self.out_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=use_bias,
+            input_is_parallel=True,
+        )
+
+        self.norm = JambaMambaRMSNormGated(
+            intermediate_size, eps=rms_norm_eps
+        )
+
+    def forward_native(self, hidden_states: torch.Tensor,
+                       attn_metadata: AttentionMetadata,
+                       conv_state: torch.Tensor, ssm_state: torch.Tensor):
+        pass
+
+    def forward_cuda(self, hidden_states: torch.Tensor,
+                     attn_metadata: AttentionMetadata,
+                     mamba_cache_params: MambaCacheParams):
+
+
+        seq_len, _ = hidden_states.shape
+        groups_time_state_size = self.n_groups * self.ssm_state_size
+
+        # 2. Convolution sequence transformation
+        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
+                                               self.conv1d.weight.size(2))
+
+        if attn_metadata.query_start_loc is not None \
+            and attn_metadata.context_lens_tensor is not None:
+            # |---------- N-1 iteration --------|
+            # |---------------- N iteration ---------------------|
+            # |- tokenA -|......................|-- newTokens ---|
+            # |---------- context_len ----------|
+            # |-------------------- seq_len ---------------------|
+            #                                   |-- query_len ---|
+            # gate, hidden_states_B_C, time_step = self.in_proj(hidden_states)
+            projected_states, _ = self.in_proj(hidden_states)
+            # # projected_states = self.in_proj(hidden_states)[0].transpose(-2, -1)
+
+            gate, hidden_states_B_C, time_step = torch.split(
+                projected_states,
+                [self.intermediate_size, self.conv_dim, self.num_heads],
+                dim=-1,
+            )
+            # what about storing the cache?
+
+            hidden_states_B_C = causal_conv1d_fn(
+                hidden_states_B_C.transpose(0, 1),
+                conv_weights,
+                self.conv1d.bias,
+                activation=self.activation,
+                conv_states=mamba_cache_params.conv_state,
+                has_initial_state=attn_metadata.context_lens_tensor > 0,
+                cache_indices=mamba_cache_params.state_indices_tensor,
+                query_start_loc=attn_metadata.query_start_loc
+            ).transpose(0, 1)[:seq_len]
+
+            hidden_states, B, C = torch.split(
+                hidden_states_B_C,
+                [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+                dim=-1,
+            )
+
+            # FIXME: think i will need to specify initial states
+            # which is of (batch, nheads, headdim, dstate)
+            scan_output, ssm_state = mamba_chunk_scan_combined(
+                hidden_states.view(1, seq_len, -1, self.head_dim),
+                time_step.unsqueeze(0),
+                self.A,
+                B.view(1, seq_len, self.n_groups, -1),
+                C.view(1, seq_len, self.n_groups, -1),
+                chunk_size=self.chunk_size,
+                D=self.D,
+                z=None,
+                dt_bias=self.dt_bias,
+                # has_initial_state=attn_metadata.context_lens_tensor > 0,
+                seq_idx=None,
+                cu_seqlens=attn_metadata.query_start_loc,
+                return_final_states=True,
+                dt_softplus=True,
+                dt_limit=(0.0, float("inf")),
+            )
+
+            ## FIXME: need to store ssm_state
+            scan_output = scan_output.view(seq_len, -1)
+            # Multiply "gate" branch and apply extra normalization layer
+            scan_output = self.norm(scan_output, gate)
+            out, _  = self.out_proj(scan_output)
+
+        else:
+            # 1. Gated MLP's linear projection
+            projected_states = self.in_proj(hidden_states)[0].transpose(-2, -1)
+            split_projection_dim = [self.intermediate_size, self.conv_dim, self.num_heads]
+            gate, hidden_states_B_C, dt = projected_states.split(split_projection_dim, dim=-1)
+
+            hidden_states_B_C = causal_conv1d_update(
+                hidden_states_B_C.transpose(0, 1),
+                mamba_cache_params.conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=mamba_cache_params.state_indices_tensor)
+            hidden_states = hidden_states.transpose(0, 1)
+
+            hidden_states, B, C = torch.split(
+                hidden_states_B_C,
+                [self.time_step_rank, self.ssm_state_size, self.ssm_state_size],
+                dim=-1,
+            )
+
+            # can be optimized
+            # A = self.A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+            # dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+            # dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+            # D = self.D[:, None, ...].expand(-1, self.head_dim)
+            # B = B.view(-1, self.n_groups, B.shape[1] // self.n_groups)
+            # C = C.view(-1, self.n_groups, C.shape[1] // self.n_groups)
+            # hidden_states_reshaped = hidden_states.view(-1, self.num_heads, self.head_dim)
+
+            # hidden_states = selective_state_update(
+            #     mamba_cache_params.ssm_state,
+            #     hidden_states_reshaped.transpose(0, 1), # transpose?
+            #     dt.transpose(0, 1), # transpose ?
+            #     A, # change to self.A
+            #     B,
+            #     C,
+            #     D, # change to self.D
+            #     z=None,
+            #     dt_bias=dt_bias,
+            #     dt_softplus=True,
+            #     state_batch_indices=mamba_cache_params.state_indices_tensor
+            # )
+            # hidden_states = hidden_states.view(-1, self.num_heads * self.head_dim)
+
+            # # gated MLP
+            # hidden_states = self.norm(hidden_states, gate)
+
+            # # 4. Final linear projection
+            # out = self.out_proj(scan_outputs.transpose(-2, -1))[0]
+
+        return out 

@@ -16,6 +16,7 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
+from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -105,7 +106,8 @@ class JambaMambaDecoderLayer(nn.Module):
                  quant_config: Optional[QuantizationConfig] = None) -> None:
         super().__init__()
         self.config = config
-        self.mamba = MambaMixer(hidden_size= config.hidden_size,
+        # self.mamba = MambaMixer(hidden_size= config.hidden_size,
+        self.mamba = MambaMixer2(hidden_size= config.hidden_size,
                                 ssm_state_size = config.mamba_d_state,
                                 conv_kernel_size = config.mamba_d_conv,
                                 intermediate_size = config.mamba_expand *\
@@ -309,19 +311,30 @@ class JambaModel(nn.Module):
         else:
             hidden_states = self.get_input_embeddings(input_ids)
         residual = None
+        if not self.config.attn_layer_period:
+            cnt = 0
         for i in range(len(self.layers)):
             layer = self.layers[i]
             kv_cache = None
             layer_mamba_cache_params = None
-            if isinstance(layer, JambaAttentionDecoderLayer):
-                kv_cache = kv_caches[(i - self.config.attn_layer_offset) //
-                                     self.config.attn_layer_period]
-            if isinstance(layer, JambaMambaDecoderLayer):
-                current_state_layer = i - (1 +
-                                           (i - self.config.attn_layer_offset)
-                                           // self.config.attn_layer_period)
-                layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
-                    current_state_layer)
+            if self.config.attn_layer_period:
+                if isinstance(layer, JambaAttentionDecoderLayer):
+                    kv_cache = kv_caches[(i - self.config.attn_layer_offset) //
+                                        self.config.attn_layer_period]
+                if isinstance(layer, JambaMambaDecoderLayer):
+                    current_state_layer = i - (1 +
+                                            (i - self.config.attn_layer_offset)
+                                            // self.config.attn_layer_period)
+                    layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
+                        current_state_layer)
+            else:
+                if isinstance(layer, JambaAttentionDecoderLayer):
+                    kv_cache = kv_caches[cnt]
+                    cnt += 1
+                if isinstance(layer, JambaMambaDecoderLayer):
+                    layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
+                        i - cnt
+                    )
 
             hidden_states, residual = layer(
                 positions=positions,
