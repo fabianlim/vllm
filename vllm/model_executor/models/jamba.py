@@ -468,12 +468,26 @@ class JambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
             self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
         world_size = get_tensor_model_parallel_world_size()
         hidden_size = self.config.hidden_size
+        # - mamba 1
+        # conv_state_shape = (
+        #     self.config.mamba_expand * hidden_size // world_size,
+        #     self.config.mamba_d_conv - 1,
+        # )
+        # temporal_state_shape = (
+        #     self.config.mamba_expand * hidden_size // world_size,
+        #     self.config.mamba_d_state,
+        # )
+        # - mamba 2
         conv_state_shape = (
-            self.config.mamba_expand * hidden_size // world_size,
+            (
+                self.config.mamba_expand * hidden_size + 
+                2 * (self.config.mamba_n_groups * self.config.mamba_d_state)
+            ) // world_size,
             self.config.mamba_d_conv - 1,
         )
         temporal_state_shape = (
-            self.config.mamba_expand * hidden_size // world_size,
+            self.config.mamba_n_heads, 
+            self.config.mamba_d_head,
             self.config.mamba_d_state,
         )
         return conv_state_shape, temporal_state_shape

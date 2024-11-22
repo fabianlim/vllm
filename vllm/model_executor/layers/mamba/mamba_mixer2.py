@@ -54,6 +54,7 @@ class JambaMambaRMSNormGated(CustomOp):
         from vllm import _custom_ops as ops
 
         # the original code casted gate to float32 before silu
+        # hidden_states * nn.functional.silu(gate.to(torch.float32))
         out = torch.empty_like(x)
         ops.rms_norm(
             out,
@@ -62,18 +63,6 @@ class JambaMambaRMSNormGated(CustomOp):
             self.variance_epsilon,
         )
         return out
-
-    # def forward(self, hidden_states, gate=None):
-    #     input_dtype = hidden_states.dtype
-    #     hidden_states = hidden_states.to(torch.float32)
-
-    #     if gate is not None:
-    #         hidden_states = hidden_states * nn.functional.silu(gate.to(torch.float32))
-    #     variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    #     hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-
-    #     return self.weight * hidden_states.to(input_dtype)
-
 
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
 @CustomOp.register("mamba_mixer2") 
@@ -173,8 +162,18 @@ class MambaMixer2(CustomOp):
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
                                                self.conv1d.weight.size(2))
 
-        if attn_metadata.query_start_loc is not None \
-            and attn_metadata.context_lens_tensor is not None:
+        # - doing it differently from mixer v1, because a little confused 
+        #   with that logic
+        # - it seems all we need to do is to detect if there is any prefill
+        # - if there are no prefills, then we should be able to do the incremental
+        #   version
+        # - have noticed that when there are no prefills, observed 
+        #   "query_start_loc" = [0, 1, ..]
+        #   "context_lens_tensor" = [8, ...]
+        use_precomputed_states = attn_metadata.num_prefills == 0
+        # use_precomputed_states = False # for debugging
+
+        if not use_precomputed_states:
             # |---------- N-1 iteration --------|
             # |---------------- N iteration ---------------------|
             # |- tokenA -|......................|-- newTokens ---|
@@ -190,8 +189,9 @@ class MambaMixer2(CustomOp):
                 [self.intermediate_size, self.conv_dim, self.num_heads],
                 dim=-1,
             )
-            # what about storing the cache?
 
+            # - "cache_indices" upates the conv_state cache in positions
+            #   pointed to by "mamba_cache_params.state_indices_tensor"
             hidden_states_B_C = causal_conv1d_fn(
                 hidden_states_B_C.transpose(0, 1),
                 conv_weights,
@@ -209,9 +209,10 @@ class MambaMixer2(CustomOp):
                 dim=-1,
             )
 
-            # FIXME: think i will need to specify initial states
-            # which is of (batch, nheads, headdim, dstate)
-            scan_output, ssm_state = mamba_chunk_scan_combined(
+            # FIXME: will I ever need to specify "initial_states"
+            # of dims (batch, nheads, headdim, dstate)
+            # - it depends on the attn_metadata?
+            scan_output, varlen_state = mamba_chunk_scan_combined(
                 hidden_states.view(1, seq_len, -1, self.head_dim),
                 time_step.unsqueeze(0),
                 self.A,
@@ -221,69 +222,80 @@ class MambaMixer2(CustomOp):
                 D=self.D,
                 z=None,
                 dt_bias=self.dt_bias,
-                # has_initial_state=attn_metadata.context_lens_tensor > 0,
                 seq_idx=None,
                 cu_seqlens=attn_metadata.query_start_loc,
-                return_final_states=True,
+                return_varlen_states=True,
+                return_final_states=False,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
             )
 
-            ## FIXME: need to store ssm_state
+            # update ssm states
+            # - varlen state is a (batch, nheads, headdim, dstate) tensor
+            for i, idx in enumerate(mamba_cache_params.state_indices_tensor):
+                mamba_cache_params.ssm_state[idx].copy_(varlen_state[i])
+
             scan_output = scan_output.view(seq_len, -1)
-            # Multiply "gate" branch and apply extra normalization layer
             scan_output = self.norm(scan_output, gate)
             out, _  = self.out_proj(scan_output)
 
         else:
             # 1. Gated MLP's linear projection
-            projected_states = self.in_proj(hidden_states)[0].transpose(-2, -1)
+            projected_states, _ = self.in_proj(hidden_states)
             split_projection_dim = [self.intermediate_size, self.conv_dim, self.num_heads]
             gate, hidden_states_B_C, dt = projected_states.split(split_projection_dim, dim=-1)
 
             hidden_states_B_C = causal_conv1d_update(
-                hidden_states_B_C.transpose(0, 1),
+                hidden_states_B_C,
                 mamba_cache_params.conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=mamba_cache_params.state_indices_tensor)
-            hidden_states = hidden_states.transpose(0, 1)
+                conv_state_indices=mamba_cache_params.state_indices_tensor
+            )
 
             hidden_states, B, C = torch.split(
                 hidden_states_B_C,
-                [self.time_step_rank, self.ssm_state_size, self.ssm_state_size],
+                [self.intermediate_size, groups_time_state_size, groups_time_state_size],
                 dim=-1,
             )
 
-            # can be optimized
-            # A = self.A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
-            # dt = dt[:, :, None].expand(-1, -1, self.head_dim)
-            # dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
-            # D = self.D[:, None, ...].expand(-1, self.head_dim)
-            # B = B.view(-1, self.n_groups, B.shape[1] // self.n_groups)
-            # C = C.view(-1, self.n_groups, C.shape[1] // self.n_groups)
-            # hidden_states_reshaped = hidden_states.view(-1, self.num_heads, self.head_dim)
+            # NOTE: can be optimized? 
+            A = self.A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+            dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+            dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+            D = self.D[:, None, ...].expand(-1, self.head_dim)
+            B = B.view(-1, self.n_groups, B.shape[1] // self.n_groups)
+            C = C.view(-1, self.n_groups, C.shape[1] // self.n_groups)
+            hidden_states_reshaped = hidden_states.view(-1, self.num_heads, self.head_dim)
 
-            # hidden_states = selective_state_update(
-            #     mamba_cache_params.ssm_state,
-            #     hidden_states_reshaped.transpose(0, 1), # transpose?
-            #     dt.transpose(0, 1), # transpose ?
-            #     A, # change to self.A
-            #     B,
-            #     C,
-            #     D, # change to self.D
-            #     z=None,
-            #     dt_bias=dt_bias,
-            #     dt_softplus=True,
-            #     state_batch_indices=mamba_cache_params.state_indices_tensor
-            # )
-            # hidden_states = hidden_states.view(-1, self.num_heads * self.head_dim)
+            # - the hidden is reshaped into number of current batches
+            # - in this case there is no more prefil, so the batches gen
+            #   1 token at a time
+            # - thus hidden will be (bs, num_heads, head_dim)
+            # - mamba_cache_params.ssm_state's slots will be selected
+            #   using "mamba_cache_params.state_indices_tensor", just as
+            #   above in the prefill case
+
+            hidden_states = selective_state_update(
+                mamba_cache_params.ssm_state,
+                hidden_states_reshaped,
+                dt,
+                A, 
+                B,
+                C,
+                D, 
+                z=None,
+                dt_bias=dt_bias,
+                dt_softplus=True,
+                state_batch_indices=mamba_cache_params.state_indices_tensor,
+            )
+            hidden_states = hidden_states.view(-1, self.num_heads * self.head_dim)
 
             # # gated MLP
-            # hidden_states = self.norm(hidden_states, gate)
+            hidden_states = self.norm(hidden_states, gate)
 
             # # 4. Final linear projection
-            # out = self.out_proj(scan_outputs.transpose(-2, -1))[0]
+            out, _ = self.out_proj(hidden_states)
 
         return out 
