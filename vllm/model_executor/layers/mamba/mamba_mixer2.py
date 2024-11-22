@@ -3,12 +3,8 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 from vllm.attention.backends.abstract import AttentionMetadata
-from vllm.distributed.parallel_state import (
-    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               MergedColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn, causal_conv1d_update)
@@ -17,19 +13,13 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
 from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
 
-# FIXME: 
+# FIXME: we should copy in the kernels
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
-
-# from vllm.model_executor.layers.layernorm import RMSNorm
-
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 from vllm.model_executor.custom_op import CustomOp
 
-
-# FIMX:
-# vllm.model_executor.layers.layernorm import RMSNorm
-# Taken from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
+# Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
 @CustomOp.register("jamba_gated_rms_norm")
 class JambaMambaRMSNormGated(CustomOp):
     def __init__(self, hidden_size, eps=1e-6):
@@ -120,6 +110,10 @@ class MambaMixer2(CustomOp):
             bias=use_bias
         )
 
+        # unlike mamba_mixer.py (v1), we do not TP the A matrix as it is 
+        # already quite small. 
+        # - same for dt_bias and D
+
         def A_weight_loader(param: Parameter, loaded_weight: torch.Tensor):
             param.data.copy_(-torch.exp(loaded_weight.float()))
 
@@ -128,11 +122,10 @@ class MambaMixer2(CustomOp):
                 num_heads,
                 dtype=torch.float32,
             ))
+        set_weight_attrs(self.A, {"weight_loader": A_weight_loader})
+
         self.dt_bias = nn.Parameter(torch.ones(num_heads))
         self.D = nn.Parameter(torch.ones(num_heads))
-
-        # set_weight_attrs(self.D, {"weight_loader": weight_loader})
-        set_weight_attrs(self.A, {"weight_loader": A_weight_loader})
 
         self.out_proj = RowParallelLinear(
             intermediate_size,
@@ -158,20 +151,27 @@ class MambaMixer2(CustomOp):
         seq_len, _ = hidden_states.shape
         groups_time_state_size = self.n_groups * self.ssm_state_size
 
+        # - doing it differently from mixer v1; little confused with its logic
+        # - we need to do is to detect if there is any prefill; if there are 
+        #   no prefils, then each example will be coming in one sample at a time
+        # - on the other hand v1 checks for "query_start_loc" and "context_lens_tensor"
+        #   however we have noticed that, even when the samples are coming in
+        #   one at a time, they are still non-NO.e
+        #   * "query_start_loc" = [0, 1, ..]
+        #   * "context_lens_tensor" = [8, ...]
+        use_precomputed_states = attn_metadata.num_prefills == 0
+
+        # 1. Gated MLP's linear projection
+        projected_states, _ = self.in_proj(hidden_states)
+        gate, hidden_states_B_C, dt = torch.split(
+            projected_states,
+            [self.intermediate_size, self.conv_dim, self.num_heads],
+            dim=-1,
+        )
+
         # 2. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
                                                self.conv1d.weight.size(2))
-
-        # - doing it differently from mixer v1, because a little confused 
-        #   with that logic
-        # - it seems all we need to do is to detect if there is any prefill
-        # - if there are no prefills, then we should be able to do the incremental
-        #   version
-        # - have noticed that when there are no prefills, observed 
-        #   "query_start_loc" = [0, 1, ..]
-        #   "context_lens_tensor" = [8, ...]
-        use_precomputed_states = attn_metadata.num_prefills == 0
-        # use_precomputed_states = False # for debugging
 
         if not use_precomputed_states:
             # |---------- N-1 iteration --------|
@@ -180,15 +180,6 @@ class MambaMixer2(CustomOp):
             # |---------- context_len ----------|
             # |-------------------- seq_len ---------------------|
             #                                   |-- query_len ---|
-            # gate, hidden_states_B_C, time_step = self.in_proj(hidden_states)
-            projected_states, _ = self.in_proj(hidden_states)
-            # # projected_states = self.in_proj(hidden_states)[0].transpose(-2, -1)
-
-            gate, hidden_states_B_C, time_step = torch.split(
-                projected_states,
-                [self.intermediate_size, self.conv_dim, self.num_heads],
-                dim=-1,
-            )
 
             # - "cache_indices" upates the conv_state cache in positions
             #   pointed to by "mamba_cache_params.state_indices_tensor"
@@ -202,19 +193,30 @@ class MambaMixer2(CustomOp):
                 cache_indices=mamba_cache_params.state_indices_tensor,
                 query_start_loc=attn_metadata.query_start_loc
             ).transpose(0, 1)[:seq_len]
-
-            hidden_states, B, C = torch.split(
+        else:
+            hidden_states_B_C = causal_conv1d_update(
                 hidden_states_B_C,
-                [self.intermediate_size, groups_time_state_size, groups_time_state_size],
-                dim=-1,
+                mamba_cache_params.conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=mamba_cache_params.state_indices_tensor
             )
 
+        # - get hidden_states, B and C after depthwise convolution.
+        hidden_states, B, C = torch.split(
+            hidden_states_B_C,
+            [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+            dim=-1,
+        )
+
+        # 3. State Space Model sequence transformation
+        if not use_precomputed_states:
             # FIXME: will I ever need to specify "initial_states"
             # of dims (batch, nheads, headdim, dstate)
-            # - it depends on the attn_metadata?
             scan_output, varlen_state = mamba_chunk_scan_combined(
                 hidden_states.view(1, seq_len, -1, self.head_dim),
-                time_step.unsqueeze(0),
+                dt.unsqueeze(0),
                 self.A,
                 B.view(1, seq_len, self.n_groups, -1),
                 C.view(1, seq_len, self.n_groups, -1),
@@ -235,30 +237,9 @@ class MambaMixer2(CustomOp):
             for i, idx in enumerate(mamba_cache_params.state_indices_tensor):
                 mamba_cache_params.ssm_state[idx].copy_(varlen_state[i])
 
-            scan_output = scan_output.view(seq_len, -1)
-            scan_output = self.norm(scan_output, gate)
-            out, _  = self.out_proj(scan_output)
-
+            # - reshape
+            hidden_states = scan_output.view(seq_len, -1)
         else:
-            # 1. Gated MLP's linear projection
-            projected_states, _ = self.in_proj(hidden_states)
-            split_projection_dim = [self.intermediate_size, self.conv_dim, self.num_heads]
-            gate, hidden_states_B_C, dt = projected_states.split(split_projection_dim, dim=-1)
-
-            hidden_states_B_C = causal_conv1d_update(
-                hidden_states_B_C,
-                mamba_cache_params.conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=mamba_cache_params.state_indices_tensor
-            )
-
-            hidden_states, B, C = torch.split(
-                hidden_states_B_C,
-                [self.intermediate_size, groups_time_state_size, groups_time_state_size],
-                dim=-1,
-            )
 
             # NOTE: can be optimized? 
             A = self.A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
@@ -292,10 +273,9 @@ class MambaMixer2(CustomOp):
             )
             hidden_states = hidden_states.view(-1, self.num_heads * self.head_dim)
 
-            # # gated MLP
-            hidden_states = self.norm(hidden_states, gate)
+        # # 4. gated MLP
+        hidden_states = self.norm(hidden_states, gate)
 
-            # # 4. Final linear projection
-            out, _ = self.out_proj(hidden_states)
-
+        # # 5. Final linear projection
+        out, _ = self.out_proj(hidden_states)
         return out 

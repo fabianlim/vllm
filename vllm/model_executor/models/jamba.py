@@ -97,6 +97,10 @@ class JambaMLP(JambaMoE):
                          tp_size=tp_size,
                          quant_config=quant_config)
 
+MAMBA_MIXER_CLASSES = {
+    'v1': MambaMixer,
+    'v2': MambaMixer2,
+}
 
 class JambaMambaDecoderLayer(nn.Module):
 
@@ -107,8 +111,8 @@ class JambaMambaDecoderLayer(nn.Module):
                  quant_config: Optional[QuantizationConfig] = None) -> None:
         super().__init__()
         self.config = config
-        # self.mamba = MambaMixer(hidden_size= config.hidden_size,
-        self.mamba = MambaMixer2(hidden_size= config.hidden_size,
+        mixer_cls = MAMBA_MIXER_CLASSES[self.config.mamba_version]
+        self.mamba = mixer_cls(hidden_size= config.hidden_size,
                                 ssm_state_size = config.mamba_d_state,
                                 conv_kernel_size = config.mamba_d_conv,
                                 intermediate_size = config.mamba_expand *\
@@ -330,30 +334,17 @@ class JambaModel(nn.Module):
         else:
             hidden_states = self.get_input_embeddings(input_ids)
         residual = None
-        if not self.config.attn_layer_period:
-            cnt = 0
+        num_attn = 0
         for i in range(len(self.layers)):
             layer = self.layers[i]
             kv_cache = None
+            if isinstance(layer, JambaAttentionDecoderLayer):
+                kv_cache = kv_caches[num_attn]
+                num_attn += 1
+
             layer_mamba_cache_params = None
-            if self.config.attn_layer_period:
-                if isinstance(layer, JambaAttentionDecoderLayer):
-                    kv_cache = kv_caches[(i - self.config.attn_layer_offset) //
-                                        self.config.attn_layer_period]
-                if isinstance(layer, JambaMambaDecoderLayer):
-                    current_state_layer = i - (1 +
-                                            (i - self.config.attn_layer_offset)
-                                            // self.config.attn_layer_period)
-                    layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
-                        current_state_layer)
-            else:
-                if isinstance(layer, JambaAttentionDecoderLayer):
-                    kv_cache = kv_caches[cnt]
-                    cnt += 1
-                if isinstance(layer, JambaMambaDecoderLayer):
-                    layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
-                        i - cnt
-                    )
+            if isinstance(layer, JambaMambaDecoderLayer):
+                layer_mamba_cache_params = mamba_cache_params.at_layer_idx(i - num_attn)
 
             hidden_states, residual = layer(
                 positions=positions,
@@ -468,28 +459,38 @@ class JambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
             self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
         world_size = get_tensor_model_parallel_world_size()
         hidden_size = self.config.hidden_size
-        # - mamba 1
-        # conv_state_shape = (
-        #     self.config.mamba_expand * hidden_size // world_size,
-        #     self.config.mamba_d_conv - 1,
-        # )
-        # temporal_state_shape = (
-        #     self.config.mamba_expand * hidden_size // world_size,
-        #     self.config.mamba_d_state,
-        # )
-        # - mamba 2
-        conv_state_shape = (
-            (
-                self.config.mamba_expand * hidden_size + 
-                2 * (self.config.mamba_n_groups * self.config.mamba_d_state)
-            ) // world_size,
-            self.config.mamba_d_conv - 1,
-        )
-        temporal_state_shape = (
-            self.config.mamba_n_heads, 
-            self.config.mamba_d_head,
-            self.config.mamba_d_state,
-        )
+
+        conv_state_shape, temporal_state_shape = None, None
+
+        intermediate_size = self.config.mamba_expand * hidden_size
+
+        if self.config.mamba_version == "v1":
+            conv_state_shape = (
+                intermediate_size // world_size,
+                self.config.mamba_d_conv - 1,
+            )
+            temporal_state_shape = (
+                intermediate_size // world_size,
+                self.config.mamba_d_state,
+            )
+
+        if self.config.mamba_version == "v2":
+            conv_dim = (
+                intermediate_size + 
+                2 * self.config.mamba_n_groups * self.config.mamba_d_state
+            )
+            conv_state_shape = (
+                conv_dim // world_size,
+                self.config.mamba_d_conv - 1,
+            )
+            # These are not TP-ed as they depend on A, dt_bias, D
+            # - they are typically small
+            #   e.g., (h_heads, d_head, d_state) = (128, 64, 128)
+            temporal_state_shape = (
+                self.config.mamba_n_heads, 
+                self.config.mamba_d_head,
+                self.config.mamba_d_state,
+            )
         return conv_state_shape, temporal_state_shape
 
     def compute_logits(
