@@ -10,11 +10,11 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn, causal_conv1d_update)
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     selective_scan_fn, selective_state_update)
+from vllm.model_executor.layers.mamba.ops.ssd_combined import (
+    mamba_chunk_scan_combined)
 from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
 
-# FIXME: we should copy in the kernels
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 from typing import Tuple, Union
 from vllm.model_executor.custom_op import CustomOp
