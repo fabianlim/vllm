@@ -6,6 +6,8 @@ from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
+
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn, causal_conv1d_update)
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
@@ -16,7 +18,7 @@ from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
 
 
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional
 from vllm.model_executor.custom_op import CustomOp
 
 # Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
@@ -80,7 +82,8 @@ class MambaMixer2(CustomOp):
                  num_heads: int = 128,
                  head_dim: int = 64,
                  rms_norm_eps: float = 1e-5,
-                 activation="silu"):
+                 activation="silu",
+                 quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
         self.time_step_rank = time_step_rank
         self.ssm_state_size = ssm_state_size
@@ -97,6 +100,7 @@ class MambaMixer2(CustomOp):
             input_size=conv_kernel_size,
             output_size=self.conv_dim,
             bias=use_conv_bias,
+            quant_config=None,
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
@@ -107,8 +111,8 @@ class MambaMixer2(CustomOp):
         self.in_proj = ColumnParallelLinear(
             input_size=hidden_size,
             output_size=intermediate_size + self.conv_dim + self.num_heads,
-            bias=use_bias
-        )
+            bias=use_bias,
+            quant_config=quant_config)
 
         # unlike mamba_mixer.py (v1), we do not TP the A matrix as it is 
         # already quite small. 
@@ -132,7 +136,7 @@ class MambaMixer2(CustomOp):
             hidden_size,
             bias=use_bias,
             input_is_parallel=True,
-        )
+            quant_config=quant_config)
 
         self.norm = JambaMambaRMSNormGated(
             intermediate_size, eps=rms_norm_eps

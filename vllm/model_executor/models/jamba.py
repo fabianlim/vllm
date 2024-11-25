@@ -122,7 +122,8 @@ class JambaMambaDecoderLayer(nn.Module):
                                 use_bias = config.mamba_proj_bias,
                                 use_rms_norm=True,
                                 rms_norm_eps=config.rms_norm_eps,
-                                activation=config.hidden_act)
+                                activation=config.hidden_act,
+                                quant_config=quant_config)
 
         num_experts = config.layers_num_experts[layer_idx]
         ffn_layer_class = JambaMoE if num_experts > 1 else JambaMLP
