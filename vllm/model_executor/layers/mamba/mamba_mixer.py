@@ -10,12 +10,15 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
                                                RowParallelLinear)
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn, causal_conv1d_update)
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     selective_scan_fn, selective_state_update)
 from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
+
+from typing import Optional
 
 
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
@@ -41,12 +44,15 @@ class MambaMixer(CustomOp):
                  use_bias: bool,
                  use_rms_norm: bool,
                  rms_norm_eps: float = 1e-5,
-                 activation="silu"):
+                 activation="silu",
+                 quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
         self.time_step_rank = time_step_rank
         self.ssm_state_size = ssm_state_size
         self.use_rms_norm = use_rms_norm
         self.activation = activation
+
+        assert quant_config is None, "does not support quantization"
 
         self.conv1d = ColumnParallelLinear(
             input_size=conv_kernel_size,
