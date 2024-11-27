@@ -13,7 +13,9 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                ReplicatedLinear,
+                                               MergedColumnParallelLinear,
                                                RowParallelLinear)
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
@@ -97,6 +99,45 @@ class JambaMLP(JambaMoE):
                          tp_size=tp_size,
                          quant_config=quant_config)
 
+# a native MLP that does not build on MoE
+class JambaMLPv2(nn.Module):
+
+    def __init__(
+        self,
+        config: JambaConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=config.hidden_size,
+            output_sizes=[config.intermediate_size] * 2,
+            bias=bias,
+            quant_config=quant_config,
+        )
+        self.down_proj = RowParallelLinear(
+            input_size=config.intermediate_size,
+            output_size=config.hidden_size,
+            bias=bias,
+            quant_config=quant_config,
+        )
+        if config.hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {config.hidden_act}. "
+                             "Only silu is supported for now.")
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        x, _ = self.gate_up_proj(x)
+        x = self.act_fn(x)
+        x, _ = self.down_proj(x)
+        return x
+
+JAMBA_MLP_KEY = "NATIVE"
+JAMBA_MLP_CLASSES = {
+    "MOE": JambaMLP,
+    "NATIVE": JambaMLPv2,
+}
+
 MAMBA_MIXER_CLASSES = {
     'v1': MambaMixer,
     'v2': MambaMixer2,
@@ -126,7 +167,7 @@ class JambaMambaDecoderLayer(nn.Module):
                                 quant_config=quant_config)
 
         num_experts = config.layers_num_experts[layer_idx]
-        ffn_layer_class = JambaMoE if num_experts > 1 else JambaMLP
+        ffn_layer_class = JambaMoE if num_experts > 1 else JAMBA_MLP_CLASSES[JAMBA_MLP_KEY]
         self.feed_forward = ffn_layer_class(config, quant_config=quant_config)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -225,7 +266,7 @@ class JambaAttentionDecoderLayer(nn.Module):
         )
 
         num_experts = config.layers_num_experts[layer_idx]
-        ffn_layer_class = JambaMoE if num_experts > 1 else JambaMLP
+        ffn_layer_class = JambaMoE if num_experts > 1 else JAMBA_MLP_CLASSES[JAMBA_MLP_KEY]
         self.feed_forward = ffn_layer_class(config, quant_config=quant_config)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -520,13 +561,21 @@ class JambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
             ("qkv_proj", "v_proj", "v"),
         ]
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts)
+        if JAMBA_MLP_KEY == 'NATIVE':
+            # then we stack the gate_up as well
+            stacked_params_mapping += [
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
+            expert_params_mapping = []
+        else:
+            # Params for weights, fp8 weight scales, fp8 activation scales
+            # (param_name, weight_name, expert_id, shard_id)
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.num_experts)
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
@@ -540,9 +589,10 @@ class JambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
-            if "feed_forward" in name and not _is_moe_layer(name):
-                ## map MLP layers to expert with ID=0
-                name = name.replace("feed_forward", "feed_forward.experts.0")
+            if JAMBA_MLP_KEY == 'MOE':
+                if "feed_forward" in name and not _is_moe_layer(name):
+                    ## map MLP layers to expert with ID=0
+                    name = name.replace("feed_forward", "feed_forward.experts.0")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
