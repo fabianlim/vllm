@@ -132,11 +132,20 @@ class JambaMLPv2(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
-JAMBA_MLP_KEY = "NATIVE"
 JAMBA_MLP_CLASSES = {
     "MOE": JambaMLP,
     "NATIVE": JambaMLPv2,
 }
+
+def get_mlp_class_key(quant_config: QuantizationConfig):
+    if quant_config is None:
+        return 'MOE'
+
+    if quant_config.target_scheme_map['Linear']['input_activations'].strategy == 'token':
+        return 'NATIVE'
+
+    return 'MOE'
+
 
 MAMBA_MIXER_CLASSES = {
     'v1': MambaMixer,
@@ -167,7 +176,7 @@ class JambaMambaDecoderLayer(nn.Module):
                                 quant_config=quant_config)
 
         num_experts = config.layers_num_experts[layer_idx]
-        ffn_layer_class = JambaMoE if num_experts > 1 else JAMBA_MLP_CLASSES[JAMBA_MLP_KEY]
+        ffn_layer_class = JambaMoE if num_experts > 1 else JAMBA_MLP_CLASSES[get_mlp_class_key(quant_config)]
         self.feed_forward = ffn_layer_class(config, quant_config=quant_config)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -266,7 +275,7 @@ class JambaAttentionDecoderLayer(nn.Module):
         )
 
         num_experts = config.layers_num_experts[layer_idx]
-        ffn_layer_class = JambaMoE if num_experts > 1 else JAMBA_MLP_CLASSES[JAMBA_MLP_KEY]
+        ffn_layer_class = JambaMoE if num_experts > 1 else JAMBA_MLP_CLASSES[get_mlp_class_key(quant_config)]
         self.feed_forward = ffn_layer_class(config, quant_config=quant_config)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -429,6 +438,8 @@ class JambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
         assert not cache_config.enable_prefix_caching, \
             "Jamba currently does not support prefix caching"
 
+        self.quant_config = vllm_config.quant_config
+
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
@@ -561,7 +572,7 @@ class JambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
             ("qkv_proj", "v_proj", "v"),
         ]
 
-        if JAMBA_MLP_KEY == 'NATIVE':
+        if get_mlp_class_key(self.quant_config) == 'NATIVE':
             # then we stack the gate_up as well
             stacked_params_mapping += [
                 ("gate_up_proj", "gate_proj", 0),
@@ -589,7 +600,7 @@ class JambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
-            if JAMBA_MLP_KEY == 'MOE':
+            if get_mlp_class_key(self.quant_config) == 'MOE':
                 if "feed_forward" in name and not _is_moe_layer(name):
                     ## map MLP layers to expert with ID=0
                     name = name.replace("feed_forward", "feed_forward.experts.0")
