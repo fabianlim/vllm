@@ -14,6 +14,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 
+from vllm.debug import are_we_go
 import vllm.envs as envs
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.attention.backends.abstract import AttentionState
@@ -1648,6 +1649,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start = torch.cuda.Event(enable_timing=True)
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
+
+        # if are_we_go():
+        #     import pdb; pdb.set_trace()
 
         with set_forward_context(model_input.attn_metadata):
             hidden_or_intermediate_states = model_executable(

@@ -4,6 +4,8 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from vllm.debug import are_we_go
+
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)

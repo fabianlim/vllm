@@ -174,6 +174,7 @@ class JambaMambaDecoderLayer(nn.Module):
                                 rms_norm_eps=config.rms_norm_eps,
                                 activation=config.hidden_act,
                                 quant_config=quant_config)
+        self.mamba.layer_idx = layer_idx
 
         num_experts = config.layers_num_experts[layer_idx]
         ffn_layer_class = JambaMoE if num_experts > 1 else JAMBA_MLP_CLASSES[get_mlp_class_key(quant_config)]

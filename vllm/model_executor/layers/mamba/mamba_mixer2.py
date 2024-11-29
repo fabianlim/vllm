@@ -21,6 +21,8 @@ from vllm.model_executor.utils import set_weight_attrs
 from typing import Tuple, Union, Optional
 from vllm.model_executor.custom_op import CustomOp
 
+from vllm.debug import are_we_go
+
 # Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
 @CustomOp.register("jamba_gated_rms_norm")
 class JambaMambaRMSNormGated(CustomOp):
@@ -261,6 +263,10 @@ class MambaMixer2(CustomOp):
             # - mamba_cache_params.ssm_state's slots will be selected
             #   using "mamba_cache_params.state_indices_tensor", just as
             #   above in the prefill case
+
+            # if are_we_go() and self.layer_idx == 0:
+            #     print ('selective_state_update')
+            #     import pdb; pdb.set_trace()
 
             hidden_states = selective_state_update(
                 mamba_cache_params.ssm_state,
