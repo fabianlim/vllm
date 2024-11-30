@@ -22,8 +22,8 @@ from typing import Tuple, Union, Optional
 from vllm.model_executor.custom_op import CustomOp
 
 # Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
-@CustomOp.register("jamba_gated_rms_norm")
-class JambaMambaRMSNormGated(CustomOp):
+@CustomOp.register("mixer2_gated_rms_norm")
+class Mixer2RMSNormGated(CustomOp):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.hidden_size = hidden_size
@@ -138,7 +138,7 @@ class MambaMixer2(CustomOp):
             input_is_parallel=True,
             quant_config=quant_config)
 
-        self.norm = JambaMambaRMSNormGated(
+        self.norm = Mixer2RMSNormGated(
             intermediate_size, eps=rms_norm_eps
         )
 
