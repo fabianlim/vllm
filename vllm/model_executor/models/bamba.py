@@ -309,6 +309,18 @@ class BambaModel(nn.Module):
         mamba_cache_params: MambaCacheParams,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+
+        # add additional attn_metadata for the mixer layers
+        if attn_metadata.num_prefills > 0:
+            sed_idx = torch.zeros_like(input_ids, dtype=torch.int32)
+            for i, (srt, end) in enumerate(zip(
+                attn_metadata.query_start_loc,
+                attn_metadata.query_start_loc[1:],
+            )):
+                sed_idx[srt:end] = i
+
+            attn_metadata.seq_idx = sed_idx
+
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:

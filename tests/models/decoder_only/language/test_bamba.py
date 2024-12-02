@@ -13,7 +13,7 @@ from vllm.worker.model_runner import _get_graph_batch_size
 from ...utils import check_outputs_equal
 
 # will be ch
-MODELS = ["/workspace/bamba-ckpt",]
+MODELS = ["/workspace/bamba-ckpt-fp16",]
 
 
 # Use lower-level interfaces to create this greedy generator, as mamba will

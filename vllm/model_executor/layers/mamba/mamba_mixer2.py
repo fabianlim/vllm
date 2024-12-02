@@ -228,7 +228,7 @@ class MambaMixer2(CustomOp):
                 D=self.D,
                 z=None,
                 dt_bias=self.dt_bias,
-                seq_idx=None,
+                seq_idx=attn_metadata.seq_idx.unsqueeze(0),
                 cu_seqlens=attn_metadata.query_start_loc,
                 return_varlen_states=True,
                 return_final_states=False,
