@@ -16,7 +16,7 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -126,14 +126,14 @@ class BambaAttentionDecoderLayer(nn.Module):
         self,
         config: BambaConfig,
         layer_idx: int,
-        attn_rotary_emb: int = 64,
-        rope_theta: float = 10000,
-        max_position_embeddings: int = 8192,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        rope_theta = getattr(config, "rope_theta", 10000)
+        max_position_embeddings = getattr(config, "max_position_embeddings",
+                                          8192)
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
@@ -156,13 +156,13 @@ class BambaAttentionDecoderLayer(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=attn_rotary_emb,
-            max_position=max_position_embeddings,
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=config.attn_rotary_emb,
+            max_position_embeddings=max_position_embeddings,
             base=rope_theta,
-            rope_scaling=None,
             is_neox_style=True,
+            dtype=torch.get_default_dtype(), # see impl of get_rope
         )
 
         self.qkv_proj = QKVParallelLinear(
@@ -203,8 +203,26 @@ class BambaAttentionDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.rotary_emb:
-            q, k = self.rotary_emb(positions, q, k)
+
+        # because the bamba model may potentially handle long sequences, 
+        # we should adjust the sin_cos cache if necesary to avoid out of bounds
+        # - first get the max_position
+        max_position = max(
+            getattr(attn_metadata, 'max_prefill_seq_len', 0),
+            getattr(attn_metadata, 'max_decode_seq_len', 0),
+        )
+        if max_position == 0:
+            # if we cannot get the max lenght from the metadata, then
+            # get it frmo the positions
+            max_position = positions.max().item()
+
+        if self.rotary_emb.max_position_embeddings <= max_position:
+            # we set it to the next power of two that covers it
+            while self.rotary_emb.max_position_embeddings <= max_position:
+                self.rotary_emb.max_position_embeddings *= 2
+            self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
+
+        q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
         return output
@@ -347,7 +365,7 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
         lora_config = vllm_config.lora_config
         scheduler_config = vllm_config.scheduler_config
         assert not cache_config.enable_prefix_caching, \
-            "Jamba currently does not support prefix caching"
+            "Bamba currently does not support prefix caching"
 
         self.quant_config = vllm_config.quant_config
 
