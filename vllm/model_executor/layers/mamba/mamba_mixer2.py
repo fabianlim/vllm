@@ -163,7 +163,7 @@ class MambaMixer2(CustomOp):
         #   one at a time, they are still non-NO.e
         #   * "query_start_loc" = [0, 1, ..]
         #   * "context_lens_tensor" = [8, ...]
-        use_precomputed_states = attn_metadata.num_prefills == 0
+        has_prefill = attn_metadata.num_prefills > 0 
 
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
@@ -177,7 +177,7 @@ class MambaMixer2(CustomOp):
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
                                                self.conv1d.weight.size(2))
 
-        if not use_precomputed_states:
+        if has_prefill:
             # |---------- N-1 iteration --------|
             # |---------------- N iteration ---------------------|
             # |- tokenA -|......................|-- newTokens ---|
@@ -215,9 +215,21 @@ class MambaMixer2(CustomOp):
         )
 
         # 3. State Space Model sequence transformation
-        if not use_precomputed_states:
-            # FIXME: will I ever need to specify "initial_states"
-            # of dims (batch, nheads, headdim, dstate)
+        if has_prefill:
+            
+            # FIXME: we are having problems using mamba_chunk_scan_combined
+            # with chunked prefill. This is because there is no
+            # initial_states requires initial_states.shape[0] to match
+            # the batch size, but cu_seqlens requires batch_size = 1.
+            # Therefore as of now, initial_states and cu_seqlens are 
+            # mutually exclusive.
+
+            initial_states = None
+            # if any(attn_metadata.context_lens_tensor > 0):
+            #     initial_states = mamba_cache_params.ssm_state[
+            #         mamba_cache_params.state_indices_tensor
+            #     ]
+
             scan_output, varlen_state = mamba_chunk_scan_combined(
                 hidden_states.view(1, seq_len, -1, self.head_dim),
                 dt.unsqueeze(0),
@@ -230,6 +242,7 @@ class MambaMixer2(CustomOp):
                 dt_bias=self.dt_bias,
                 seq_idx=attn_metadata.seq_idx.unsqueeze(0),
                 cu_seqlens=attn_metadata.query_start_loc,
+                initial_states=initial_states,
                 return_varlen_states=True,
                 return_final_states=False,
                 dt_softplus=True,

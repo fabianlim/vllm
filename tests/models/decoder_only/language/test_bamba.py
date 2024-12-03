@@ -120,11 +120,7 @@ def test_chunked_prefill_with_parallel_sampling(vllm_runner, example_prompts,
             max_num_batched_tokens=30,
             max_num_seqs=10  # forces prefill chunks with decoding
     ) as vllm_model:
-        vllm_outputs = vllm_model.generate(example_prompts, sampling_params)
-
-    for i, seqs in enumerate(vllm_outputs):
-        for j, (_, x) in enumerate(seqs):
-            print (f"Test {i}, Seq {j}: {x}")
+        vllm_model.generate(example_prompts, sampling_params)
 
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("dtype", ["float"])
