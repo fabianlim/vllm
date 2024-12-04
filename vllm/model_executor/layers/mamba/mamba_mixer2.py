@@ -151,6 +151,8 @@ class MambaMixer2(CustomOp):
                      attn_metadata: AttentionMetadata,
                      mamba_cache_params: MambaCacheParams):
 
+        # if self.layer_idx == 0:
+        #     import pdb; pdb.set_trace()
 
         seq_len, _ = hidden_states.shape
         groups_time_state_size = self.n_groups * self.ssm_state_size
@@ -225,10 +227,10 @@ class MambaMixer2(CustomOp):
             # mutually exclusive.
 
             initial_states = None
-            # if any(attn_metadata.context_lens_tensor > 0):
-            #     initial_states = mamba_cache_params.ssm_state[
-            #         mamba_cache_params.state_indices_tensor
-            #     ]
+            if any(attn_metadata.context_lens_tensor > 0):
+                initial_states = mamba_cache_params.ssm_state[
+                    mamba_cache_params.state_indices_tensor
+                ]
 
             scan_output, varlen_state = mamba_chunk_scan_combined(
                 hidden_states.view(1, seq_len, -1, self.head_dim),
