@@ -8,7 +8,7 @@ from transformers import BambaConfig
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.attention.layer import Attention
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                MergedColumnParallelLinear,
@@ -82,7 +82,6 @@ class BambaMixerDecoderLayer(nn.Module):
                                 conv_kernel_size = config.mamba_d_conv,
                                 intermediate_size = config.mamba_expand *\
                                                     config.hidden_size,
-                                time_step_rank = config.mamba_dt_rank,
                                 use_conv_bias = config.mamba_conv_bias,
                                 use_bias = config.mamba_proj_bias,
                                 use_rms_norm=True,
@@ -458,12 +457,20 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
 
         intermediate_size = self.config.mamba_expand * hidden_size
 
+        # HACK! refactor
+        n_groups = self.config.mamba_n_groups
+        if n_groups % world_size != 0:
+            # - for TP we shard conv_dim by sharding on n_groups, 
+            # - but if n_groups cannot divide tp_size, we need to 
+            #   populate dummy conv weight groups
+            n_groups += world_size - (n_groups % world_size)
+
         conv_dim = (
             intermediate_size + 
-            2 * self.config.mamba_n_groups * self.config.mamba_d_state
+            2 * n_groups * self.config.mamba_d_state
         )
         conv_state_shape = (
-            conv_dim // world_size,
+            divide(conv_dim, world_size),
             self.config.mamba_d_conv - 1,
         )
 
@@ -471,7 +478,7 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
         # - they are typically small
         #   e.g., (h_heads, d_head, d_state) = (128, 64, 128)
         temporal_state_shape = (
-            self.config.mamba_n_heads, 
+            divide(self.config.mamba_n_heads, world_size),
             self.config.mamba_d_head,
             self.config.mamba_d_state,
         )
