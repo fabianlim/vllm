@@ -13,7 +13,7 @@ from vllm.worker.model_runner import _get_graph_batch_size
 from ...utils import check_outputs_equal
 
 # will be ch
-MODELS = ["/workspace/bamba-ckpt-fp16",]
+MODELS = ["ibm-fms/Bamba-9.8b-1.8T-hf"]
 
 
 # Use lower-level interfaces to create this greedy generator, as mamba will
@@ -97,7 +97,7 @@ def test_batching(
         name_1="batched_vllm",
     )
 
-
+@pytest.mark.skip("bamba does not support chunked prefill yet")
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("dtype", ["float"])
 @pytest.mark.parametrize("max_tokens", [10])
@@ -122,6 +122,7 @@ def test_chunked_prefill_with_parallel_sampling(vllm_runner, example_prompts,
     ) as vllm_model:
         vllm_model.generate(example_prompts, sampling_params)
 
+@pytest.mark.skip("bamba does not support chunked prefill yet")
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("dtype", ["float"])
 @pytest.mark.parametrize("max_tokens", [32])
