@@ -15,7 +15,8 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+    MambaMixer2, extra_groups_for_head_shards)
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
@@ -457,14 +458,14 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA):
 
         intermediate_size = self.config.mamba_expand * hidden_size
 
-        # HACK! refactor
-        n_groups = self.config.mamba_n_groups
-        if n_groups % world_size != 0:
-            # - for TP we shard conv_dim by sharding on n_groups, 
-            # - but if n_groups cannot divide tp_size, we need to 
-            #   populate dummy conv weight groups
-            n_groups += world_size - (n_groups % world_size)
+        # if n_groups is not divisible by world_size, need to extend the shards to ensure
+        # all groups needed by a head is sharded along with it
+        n_groups = (
+            self.config.mamba_n_groups + 
+            extra_groups_for_head_shards(self.config.mamba_n_groups, world_size)
+        )
 
+        # - heads and n_groups are TP-ed
         conv_dim = (
             intermediate_size + 
             2 * n_groups * self.config.mamba_d_state

@@ -83,49 +83,54 @@ class Mixer2RMSNormGated(CustomOp):
         )
         return out
 
-# def A_weight_loader(param: Parameter, loaded_weight: torch.Tensor):
-#     param.data.copy_(-torch.exp(loaded_weight.float()))
+def extra_groups_for_head_shards(ngroups: int, tp_size: int):
+    """Compute the extra (logical) groups to account for head shards"""
 
-def interleave_sharded_weight_loader(shard_axis: int, sizes: List[int], tp_size: int) -> LoaderFunction:
-    """Create a weight loader first interleave and then shards the weights along the given axis"""
+    # in the case ngoups % tp_size == 0, this will be zero
+    if ngroups % tp_size == 0:
+        return 0
+
+    return tp_size - ngroups % tp_size
+
+def mamba_v2_sharded_weight_loader(
+    shard_spec: List[int], tp_size: int, tp_rank: int,
+) -> LoaderFunction:
+    """Create a weight loader for mamba v2. This ensures that the projections are
+    correctly sharded so that they can be split into x, B, C. It also ensures the 
+    the all the groups corresponding to a head shard is placed together with it.
+    """
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
 
-        tp_rank = get_tensor_model_parallel_rank()
+        # - track boundary of (sharded) param, and loaded_weight, respectively
+        boundary, loaded_boundary = 0, 0
+        for full_dim, extra, ratio in shard_spec:
+            # - full dim is the expected size of the model
+            # - if extra > 0, this means there was some expansion
 
-        boundary = 0
-        loaded_boundary = 0
-        for sz, extra in sizes:
-            # loaded_shard_size = (sz - extra) // tp_size
-            shard_size = sz // tp_size
+            # - num of dims expected to be loaded
+            shard_size = full_dim // tp_size
 
-            loaded_start_idx = loaded_boundary + tp_rank * shard_size
-            t = min(
-                shard_size, 
-                sz - extra - tp_rank * shard_size
-            )
+            # - compute where to take the loaded shard from
+            rank = tp_rank // ratio
 
-            # HACK to simulate a sum over two groups
-            if t <= 0:
-                loaded_start_idx -= shard_size
-                t = min(
-                    shard_size, 
-                    sz - extra - (tp_rank-1) * shard_size
-                )
+            # - should start from here (determined by rank)
+            loaded_skip = rank * shard_size # take these number dims from loaded
+            loaded_start_idx = loaded_boundary + loaded_skip
 
-            if t > 0:
-            # refactor! must be a better way to do this
-            if shard_axis == 0:
+            # - these many number dims to take from loaded_weight
+            take = min(shard_size, full_dim - extra - loaded_skip)
+
+            # - always shard on dim 0
                 param.data[
-                    boundary:boundary+t,...
+                boundary:boundary+take,...
                 ] = loaded_weight[
-                        loaded_start_idx:loaded_start_idx+t
+                loaded_start_idx:loaded_start_idx+take
                 ]
-            else:
-                raise NotImplementedError
 
+            # move boundaries
             boundary += shard_size
-            loaded_boundary += (sz - extra)
+            loaded_boundary += (full_dim - extra)
 
     return loader
 
@@ -158,15 +163,20 @@ class MambaMixer2(CustomOp):
                  quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
 
-        # Currently, it seems the only way to shard on tp is
-        # - intermedidate_size
-        # - n_groups
-        # - num_heads
-        # we cannot shard on ssm_state, otherwise the temporal state
-        # will have the wrong shape
-        # - in the situations where n_groups == 1, we have to replicate
-        #   the ssm_state
+        # For TP, the sharding plan is as follows:
+        # - for the conv modules, since 
+        #   conv_dim = intermediate_size * 2 * n_groups * ssm_state_size,
+        #   we shard intermediate_size and n_groups
+        # - since intermediate_size = n_heads * head_dim, sharding on
+        #   intermediate_size is achieved by sharding on n_heads.
+        # - so if world_size divides groups, then sharding 
+        #   (n_groups / world_size, n_heads / world_size)
+        #   also maintains the invariant n_heads % n_groups == 0
+        # - HOWEVER< if world_size DOES NOT divide groups, then we need to allocate
+        #   extra space in the shard, such that the WHOLE GROUP must be placed
+        #   together with the HEAD SHARD.
         self.tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
 
         self.ssm_state_size = ssm_state_size
         self.use_rms_norm = use_rms_norm
@@ -181,8 +191,9 @@ class MambaMixer2(CustomOp):
         if n_groups % self.tp_size != 0:
             # - for TP we shard conv_dim by sharding on n_groups, 
             # - but if n_groups cannot divide tp_size, we need to 
-            #   populate dummy conv weight groups
-            self.n_groups = n_groups + self.tp_size - (n_groups % self.tp_size)
+            #   extend some extra groups
+            # self.n_groups = n_groups + self.tp_size - (n_groups % self.tp_size)
+            self.n_groups = n_groups + extra_groups_for_head_shards(n_groups, self.tp_size)
 
         self.conv_dim = (
             intermediate_size + 2 * self.n_groups * ssm_state_size
@@ -207,60 +218,46 @@ class MambaMixer2(CustomOp):
 
         # - because in_proj is a concatenation of 3 weights, we 
         #   need to interleave them before sharding
+        # - use the custom weight loader mamba_v2_sharded_weight_loader
+        #   for conv1d.bias, covn1d.weight and in_proj.weight
+        # - need to set these settings, to assign the groups to the head shards
+        group_shard_settings = (
+            self.n_groups * self.ssm_state_size, # expected model size
+            (self.n_groups - n_groups) * self.ssm_state_size, # extra dims assigned
+            self.num_heads // n_groups, # ratio for mapping back to original group
+        )
+        intemediate_settings = (intermediate_size, 0, 1)
+        head_setings = (self.num_heads, 0, 1)
 
         delattr(self.conv1d.bias, "weight_loader")
         set_weight_attrs(self.conv1d.bias, {
-            "weight_loader": interleave_sharded_weight_loader(
-                0, [
-                    (intermediate_size, 0),
-                    (
-                        self.n_groups * self.ssm_state_size, 
-                        (self.n_groups - n_groups) * self.ssm_state_size
-                    ),
-                    (
-                        self.n_groups * self.ssm_state_size, 
-                        (self.n_groups - n_groups) * self.ssm_state_size
-                    ),
+            "weight_loader": mamba_v2_sharded_weight_loader(
+                [
+                    intemediate_settings, group_shard_settings, group_shard_settings,
                 ],
-                self.tp_size,
+                self.tp_size, tp_rank,
             )
         })
 
         delattr(self.conv1d.weight, "weight_loader")
         set_weight_attrs(self.conv1d.weight, {
-            "weight_loader": interleave_sharded_weight_loader(
-                0, [
-                    (intermediate_size, 0),
-                    (
-                        self.n_groups * self.ssm_state_size, 
-                        (self.n_groups - n_groups) * self.ssm_state_size
-                    ),
-                    (
-                        self.n_groups * self.ssm_state_size, 
-                        (self.n_groups - n_groups) * self.ssm_state_size
-                    ),
+            "weight_loader": mamba_v2_sharded_weight_loader(
+                [
+                    intemediate_settings, group_shard_settings, group_shard_settings,
                 ],
-                self.tp_size,
+                self.tp_size, tp_rank
             )
         })
 
         delattr(self.in_proj.weight, "weight_loader")
         set_weight_attrs(self.in_proj.weight, {
-            "weight_loader": interleave_sharded_weight_loader(
-                0, [
-                    (intermediate_size, 0),
-                    (intermediate_size, 0),
-                    (
-                        self.n_groups * self.ssm_state_size, 
-                        (self.n_groups - n_groups) * self.ssm_state_size
-                    ),
-                    (
-                        self.n_groups * self.ssm_state_size, 
-                        (self.n_groups - n_groups) * self.ssm_state_size
-                    ),
-                    (self.num_heads, 0),
+            "weight_loader": mamba_v2_sharded_weight_loader(
+                [
+                    intemediate_settings, # for gate
+                    intemediate_settings, group_shard_settings, group_shard_settings,
+                    head_setings,  # for dt
                 ],
-                self.tp_size,
+                self.tp_size, tp_rank
             )
         })
 
