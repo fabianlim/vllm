@@ -24,6 +24,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 
 from typing import Tuple, Union, Optional, List
 from vllm.model_executor.custom_op import CustomOp
+import torch.nn.functional as F
+from transformers.activations import ACT2FN
 
 # Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
 # also referenced https://github.com/vllm-project/vllm/pull/9292
@@ -320,6 +322,9 @@ class MambaMixer2(CustomOp):
             ],
             dim=-1,
         )
+        # torch.save(dt, 'dt.out')
+        # import pdb; pdb.set_trace()
+        # dt = torch.load('dt.out')
 
         # 2. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
@@ -335,6 +340,20 @@ class MambaMixer2(CustomOp):
 
             # - "cache_indices" upates the conv_state cache in positions
             #   pointed to by "mamba_cache_params.state_indices_tensor"
+
+            # IF WE REPLACE BY THE SLOW VERSION THE CUDA MEM WILL GO AWAY
+            # hidden_states_B_C = F.conv1d(
+            #     hidden_states_B_C.transpose(0,1).unsqueeze(0), 
+            #     self.conv1d.weight, 
+            #     self.conv1d.bias, 
+            #     stride=(1,), 
+            #     padding=(self.conv1d.weight.shape[-1]-1,), 
+            #     dilation=(1,), 
+            #     groups=self.conv_dim,
+            # ).squeeze(0).transpose(0,1)[:seq_len]
+            # act = ACT2FN[self.activation]
+            # hidden_states_B_C = act(hidden_states_B_C)
+
             hidden_states_B_C = causal_conv1d_fn(
                 hidden_states_B_C.transpose(0, 1),
                 conv_weights,
@@ -346,6 +365,17 @@ class MambaMixer2(CustomOp):
                 query_start_loc=attn_metadata.query_start_loc
             ).transpose(0, 1)[:seq_len]
         else:
+            # hidden_states_B_C = F.conv1d(
+            #     hidden_states_B_C.transpose(0,1).unsqueeze(0), 
+            #     self.conv1d.weight, 
+            #     self.conv1d.bias, 
+            #     stride=(1,), 
+            #     padding=(self.conv1d.weight.shape[-1]-1,), 
+            #     dilation=(1,), 
+            #     groups=self.conv_dim,
+            # ).squeeze(0).transpose(0,1)[:seq_len]
+            # act = ACT2FN[self.activation]
+            # hidden_states_B_C = act(hidden_states_B_C)
             hidden_states_B_C = causal_conv1d_update(
                 hidden_states_B_C,
                 mamba_cache_params.conv_state,
