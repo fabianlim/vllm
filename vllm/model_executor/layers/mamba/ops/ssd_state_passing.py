@@ -40,6 +40,7 @@ def _state_passing_fwd_kernel(
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=1)
@@ -50,7 +51,9 @@ def _state_passing_fwd_kernel(
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
     final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
     if HAS_INITSTATES:
-        initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
+        initstates_ptr +=  pid_h * stride_initstates_head
+        if not IS_VARLEN:
+            initstates_ptr += pid_b * stride_initstates_batch 
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch
 
@@ -64,6 +67,7 @@ def _state_passing_fwd_kernel(
     else:
         initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
         states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+
     tl.store(out_ptrs, states, mask=offs_m < dim)
     out_ptrs += stride_out_chunk
     seq_idx = 0
@@ -73,7 +77,16 @@ def _state_passing_fwd_kernel(
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
             seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
-            scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+            # is_new_seq = seq_idx_new[0] != seq_idx[0]
+            if HAS_INITSTATES:
+                if IS_VARLEN and seq_idx != seq_idx_new:
+                    # need to add the new init state
+                    scale = 1.
+                    initstates_ptr += pid_b * stride_initstates_batch  
+                    states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+            else:
+                scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+
             seq_idx = seq_idx_new
         states = scale * states + new_states
         if c < nchunks - 1:
@@ -192,11 +205,16 @@ def _state_passing_bwd_kernel(
 
 
 def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=None, chunk_size=None,
-                       out_dtype=None):
+                       out_dtype=None, is_varlen=False):
     batch, nchunks, nheads, dim = states.shape
     assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
     if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, dim)
+        if is_varlen:
+            assert seq_idx is not None
+            assert initial_states.shape == (seq_idx.max().item()+1, nheads, dim)
+        else:
+            assert initial_states.shape == (batch, nheads, dim)
+
     if seq_idx is not None:
         assert chunk_size is not None
         seqlen = seq_idx.shape[-1]
@@ -218,6 +236,7 @@ def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=Non
             *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
             HAS_INITSTATES=initial_states is not None,
             HAS_SEQ_IDX=seq_idx is not None,
+            IS_VARLEN=is_varlen,
         )
     return out, final_states
 

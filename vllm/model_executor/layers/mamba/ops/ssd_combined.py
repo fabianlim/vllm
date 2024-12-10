@@ -283,7 +283,10 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
     if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, headdim, dstate)
+        if cu_seqlens is None:
+            assert initial_states.shape == (batch, nheads, headdim, dstate)
+        else:
+            assert initial_states.shape == (len(cu_seqlens)-1, nheads, headdim, dstate)
     # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
     # dA_cumsum_tmp0, dt_tmp0 = _chunk_cumsum_fwd(dt[:, :147], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     # dA_cumsum_tmp1, dt_tmp1 = _chunk_cumsum_fwd(dt[:, 147:], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
@@ -295,7 +298,9 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     # states_tmp2 = _chunk_state_fwd(B[:, 147:256], x[:, 147:256], dt_tmp2, dA_cumsum_tmp2, states_in_fp32=True)
     states, final_states = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
                                               initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
-                                              seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype)
+                                              seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype, 
+                                              is_varlen=True if cu_seqlens is not None else False
+                                            )
     states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
     # states_tmp0 = rearrange(_state_passing_fwd(rearrange(states_tmp0, "... p n -> ... (p n)"), dA_cumsum_tmp0[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
     # states_tmp1 = rearrange(_state_passing_fwd(rearrange(states_tmp1, "... p n -> ... (p n)"), dA_cumsum_tmp1[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
