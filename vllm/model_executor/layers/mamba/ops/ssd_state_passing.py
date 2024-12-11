@@ -77,13 +77,15 @@ def _state_passing_fwd_kernel(
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
             seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
-            # is_new_seq = seq_idx_new[0] != seq_idx[0]
             if HAS_INITSTATES:
                 if IS_VARLEN and seq_idx != seq_idx_new:
-                    # need to add the new init state
-                    scale = 1.
-                    initstates_ptr += pid_b * stride_initstates_batch  
+                    # load the 
+                    initstates_ptrs += seq_idx_new * stride_initstates_batch  
                     states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+
+                    # there was an initial state, so the one previously stored was incorrect
+                    # so we revert it here
+                    tl.store(out_ptrs - stride_out_chunk, states, mask=offs_m < dim)
             else:
                 scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
 

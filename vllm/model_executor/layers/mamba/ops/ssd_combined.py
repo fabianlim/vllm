@@ -287,6 +287,8 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
             assert initial_states.shape == (batch, nheads, headdim, dstate)
         else:
             assert initial_states.shape == (len(cu_seqlens)-1, nheads, headdim, dstate)
+
+    is_varlen = cu_seqlens is not None
     # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
     # dA_cumsum_tmp0, dt_tmp0 = _chunk_cumsum_fwd(dt[:, :147], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     # dA_cumsum_tmp1, dt_tmp1 = _chunk_cumsum_fwd(dt[:, 147:], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
@@ -299,13 +301,17 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     states, final_states = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
                                               initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
                                               seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype, 
-                                              is_varlen=True if cu_seqlens is not None else False
+                                              is_varlen=is_varlen
                                             )
     states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
     # states_tmp0 = rearrange(_state_passing_fwd(rearrange(states_tmp0, "... p n -> ... (p n)"), dA_cumsum_tmp0[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
     # states_tmp1 = rearrange(_state_passing_fwd(rearrange(states_tmp1, "... p n -> ... (p n)"), dA_cumsum_tmp1[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
-    out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
+    # - we do not pass seq_idx if varlen, because in this case the prev_states are prepared
+    out, out_x = _chunk_scan_fwd(
+        CB, x, dt, dA_cumsum, C, states, D=D, z=z, 
+        seq_idx=seq_idx if not is_varlen else None,
+    )
     if cu_seqlens is None:
         return out, out_x, dt, dA_cumsum, states, final_states
     else:
