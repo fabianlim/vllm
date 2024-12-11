@@ -283,7 +283,11 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
     if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, headdim, dstate)
+        if cu_seqlens is None:
+            assert initial_states.shape == (batch, nheads, headdim, dstate)
+        else:
+            assert initial_states.shape == (len(cu_seqlens)-1, nheads, headdim, dstate)
+
     # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
     # dA_cumsum_tmp0, dt_tmp0 = _chunk_cumsum_fwd(dt[:, :147], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     # dA_cumsum_tmp1, dt_tmp1 = _chunk_cumsum_fwd(dt[:, 147:], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
@@ -293,14 +297,19 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     # states_tmp0 = _chunk_state_fwd(B[:, :147], x[:, :147], dt_tmp0, dA_cumsum_tmp0, states_in_fp32=True)
     # states_tmp1 = _chunk_state_fwd(B[:, 147:], x[:, 147:], dt_tmp1, dA_cumsum_tmp1, states_in_fp32=True)
     # states_tmp2 = _chunk_state_fwd(B[:, 147:256], x[:, 147:256], dt_tmp2, dA_cumsum_tmp2, states_in_fp32=True)
+    # - only pass initial states at the boundary
+    initial_states_boundary = initial_states[:batch] if initial_states is not None else None
     states, final_states = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
-                                              initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
+                                              initial_states=rearrange(initial_states_boundary, "... p n -> ... (p n)") if initial_states_boundary is not None else None,
                                               seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype)
     states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
     # states_tmp0 = rearrange(_state_passing_fwd(rearrange(states_tmp0, "... p n -> ... (p n)"), dA_cumsum_tmp0[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
     # states_tmp1 = rearrange(_state_passing_fwd(rearrange(states_tmp1, "... p n -> ... (p n)"), dA_cumsum_tmp1[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
-    out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx)
+    out, out_x = _chunk_scan_fwd(
+        CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx, 
+        initial_states=initial_states,
+    )
     if cu_seqlens is None:
         return out, out_x, dt, dA_cumsum, states, final_states
     else:
