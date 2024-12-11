@@ -257,6 +257,65 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
             dD = rearrange(dD, "h 1 -> h")
     return dx, ddt.to(dtype=dt.dtype), dD
 
+# this is a temporary workaround. The better solution will be to enable
+# _chunk_scan_fwd_kernel to handle inter chunk boundaries. The best bet
+# will be to expand the number of chunks by tot_num_inter_chunks, 
+# - we could pass in offsets to adjust where x, B, C lies from the 
+#   chunk boundary
+# - BLOCK_M would have to be appropriately adjusted.
+# - init_states replace prev_states when its an interchunk
+
+def _expand(
+    data: torch.Tensor, cu_seqlens, chunk_size, 
+    running_index=False, return_indices=False,
+):
+
+    new_indices = []
+    extra = 0
+    for start, end in zip(cu_seqlens, cu_seqlens[1:]):
+        start, end = start.item(), end.item()
+        length = end - start
+        extended = math.ceil(length / chunk_size) * chunk_size
+        extra_bef = extra
+        extra += extended - length
+        new_indices.append((
+            start, end, start+extra, end+extra,
+            start + extra_bef
+        ))
+
+    if extra == 0:
+        return data
+    
+    shape = list(data.shape)
+    shape[1] = cu_seqlens[-1] + extra
+    target = torch.zeros(shape, device=data.device, dtype=data.dtype)
+
+    for start, end, start2, end2, beg, in new_indices:
+        target[:,start2:end2] = data[:,start:end]
+        if running_index:
+            target[:,beg:start2] = max(data[:,start] - 1, 0) # go down one index
+
+    del data # cleanup
+
+    if return_indices:
+        return target, new_indices
+
+    return target
+
+def _contract(
+    data: torch.Tensor, new_indices,
+):
+    assert len(new_indices) > 0
+    _, orig_len, *rest = new_indices[-1]
+
+    shape = list(data.shape)
+    shape[1] = orig_len
+    target = torch.zeros(shape, device=data.device, dtype=data.dtype)
+
+    for start, end, start2, end2, _, in new_indices:
+        target[:,start:end] = data[:,start2:end2]
+    return target
+
 def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
@@ -288,6 +347,24 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         else:
             assert initial_states.shape == (len(cu_seqlens)-1, nheads, headdim, dstate)
 
+    expansion_indices = None
+    if (
+        initial_states is not None and 
+        cu_seqlens is not None and
+        seq_idx is not None
+    ):
+        assert z is None
+        with torch.no_grad():
+            x, dt, B, C = (
+                _expand(d, cu_seqlens, chunk_size) 
+                for d in [x, dt, B, C]
+            )
+            # have to be more carefull with seq_idx
+            seq_idx, expansion_indices = _expand(
+                seq_idx, cu_seqlens, chunk_size, 
+                running_index=True, return_indices=True
+            )
+
     is_varlen = cu_seqlens is not None
     # # (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, nheads, chunk_size, chunk_size)
     # dA_cumsum_tmp0, dt_tmp0 = _chunk_cumsum_fwd(dt[:, :147], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
@@ -310,12 +387,23 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     # - we do not pass seq_idx if varlen, because in this case the prev_states are prepared
     out, out_x = _chunk_scan_fwd(
         CB, x, dt, dA_cumsum, C, states, D=D, z=z, 
-        seq_idx=seq_idx if not is_varlen else None,
+        seq_idx=None if is_varlen and initial_states is not None else seq_idx,
     )
     if cu_seqlens is None:
         return out, out_x, dt, dA_cumsum, states, final_states
     else:
         assert batch == 1, "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+
+        if expansion_indices:
+            # need to undo the expansion before varstates
+            # - FIXME: ignore out_x for now since its not returned
+            #   by the upper function
+            # B, x, out = (
+            #     _contract(d, expansion_indices) 
+            #     for d in [B, x, out]
+            # )
+            out = _contract(out, expansion_indices) 
+
         varlen_states = chunk_state_varlen(B.squeeze(0), x.squeeze(0), dt.squeeze(0), dA_cumsum.squeeze(0),
                                            cu_seqlens, states.squeeze(0))
         return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
@@ -469,6 +557,8 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
         dfinal_states = args[0] if ctx.return_final_states else None
         dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=ctx.dt_softplus, dt_limit=ctx.dt_limit)
         return dx, ddt, dA, dB, dC, None, dD, dz, ddt_bias, dinitial_states, None, None, None, None, None, None
+        
+
 
 def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False, return_varlen_states=False):
     """
@@ -489,4 +579,13 @@ def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bia
     Return:
         out: (batch, seqlen, nheads, headdim)
     """
-    return MambaChunkScanCombinedFn.apply(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, dt_limit, return_final_states, return_varlen_states)
+    # return MambaChunkScanCombinedFn.apply(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, dt_limit, return_final_states, return_varlen_states)
+
+    # refactor out from the the autograd
+
+    out, out_x, dt_out, dA_cumsum, states, final_states, *rest = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, dt_limit=dt_limit)
+    if not return_varlen_states:
+        return out if not return_final_states else (out, final_states)
+    else:
+        varlen_states = rest[0]
+        return (out, varlen_states) if not return_final_states else (out, final_states, varlen_states)
