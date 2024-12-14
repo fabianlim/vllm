@@ -134,8 +134,9 @@ def _mamba_chunk_scan_combined_fwd(x,
         states,
         D=D,
         z=z,
-        seq_idx=(None if cu_seqlens is not None and initial_states is not None
-                 else seq_idx))
+        seq_idx=seq_idx,
+        initial_states=initial_states,
+        )
     if cu_seqlens is None:
         return out, out_x, dt, dA_cumsum, states, final_states
     else:

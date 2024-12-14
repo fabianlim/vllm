@@ -343,7 +343,9 @@ def _chunk_scan_fwd(cb,
                     states,
                     D=None,
                     z=None,
-                    seq_idx=None):
+                    seq_idx=None,
+                    initial_states=None,
+                    ):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = C.shape
@@ -359,6 +361,27 @@ def _chunk_scan_fwd(cb,
     assert states.shape == (batch, nchunks, nheads, headdim, dstate)
     if seq_idx is not None:
         assert seq_idx.shape == (batch, seqlen)
+
+        if initial_states is not None:
+            # with initial states, we need to take care of how 
+            # seq_idx crosses the boundaries
+            assert batch == 1, "chunk scan only supports initial states with batch 1"
+
+            # extra = 0
+            # p = 0
+            # for i, idx in enumerate(seq_idx[0]):
+            #     c += idx % chunk_size == 0
+            #     if idx > p and i % chunk_size != 0:
+            #         # this means we have a change in sequence 
+            #         # - that does not accur on the chunk boundary
+            #         extra += 0
+            #         p = i
+
+            # compute a map
+            chunk_in
+
+
+            assert initial_states.shape = ()
     # Allocates output.
     out = torch.empty(batch,
                       seqlen,
@@ -376,6 +399,8 @@ def _chunk_scan_fwd(cb,
         assert out_x.stride() == out.stride()
     else:
         out_x = None
+
+    
     grid = lambda META: (triton.cdiv(
         chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(
             headdim, META['BLOCK_SIZE_N']), batch * nchunks, nheads)
