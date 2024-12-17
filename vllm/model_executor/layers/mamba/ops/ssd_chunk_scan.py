@@ -116,7 +116,7 @@ def _chunk_scan_fwd_kernel(
     dA_cumsum_ptr,
     seq_idx_ptr,
     C_ptr,
-    prev_states_ptr,
+    states_ptr,
     D_ptr,
     initstates_ptr,
     chunk_indices_ptr,
@@ -210,7 +210,9 @@ def _chunk_scan_fwd_kernel(
     # M-block offsets and prev states
     #  - logic in next block may override these if there is an active offset
     offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
-    prev_states_ptr += pid_b * stride_states_batch + c_idx * stride_states_chunk + pid_h * stride_states_head
+    prev_states_ptr = states_ptr + pid_b * stride_states_batch + c_idx * stride_states_chunk + pid_h * stride_states_head
+    prev_states_hdim = stride_states_hdim 
+    prev_states_dstate = stride_states_dstate
 
     # c_offset_active = False
     if HAS_SEQ_IDX:
@@ -242,8 +244,10 @@ def _chunk_scan_fwd_kernel(
                 # - replace prev_states_ptr with init_states
                 # we should never get seq_idx_m < 1, c_offset_active guarntees it
                 prev_states_ptr = initstates_ptr + (seq_idx_m -1) * stride_init_states_batch + pid_h * stride_init_states_head
-                stride_states_hdim = stride_init_states_hdim # override strides
-                stride_states_dstate = stride_init_states_dstate
+                # stride_states_hdim = stride_init_states_hdim # override strides
+                # stride_states_dstate = stride_init_states_dstate
+                prev_states_hdim = stride_init_states_hdim # override strides
+                prev_states_dstate = stride_init_states_dstate
 
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize,
@@ -304,8 +308,8 @@ def _chunk_scan_fwd_kernel(
                           offs_k_dstate[None, :] * stride_C_dstate)
         
         prev_states_ptrs = prev_states_ptr + (
-            offs_n[None, :] * stride_states_hdim +
-            offs_k_dstate[:, None] * stride_states_dstate)
+            offs_n[None, :] * prev_states_hdim +
+            offs_k_dstate[:, None] * prev_states_dstate)
         if HAS_SEQ_IDX:
 
             # - need to do this otherwise compilation errors
