@@ -185,14 +185,15 @@ def _chunk_scan_fwd_kernel(
     HAS_INITSTATES: tl.constexpr,
 ):
     pid_bc = tl.program_id(axis=1).to(tl.int64)
+    pid_c = pid_bc // batch
+    pid_b = pid_bc - pid_c * batch
     if not HAS_INITSTATES:
-        c_idx = pid_bc // batch
-        pid_b = pid_bc - c_idx * batch
+        c_idx = pid_c
+        # c_off = tl.zeros((1,), dtype=tl.int32)
+        c_off = 0
     else:
-        pid_c = pid_bc // batch
-        pid_b = pid_bc - pid_c * batch
-        c_idx = torch.load(chunk_indices_ptr + pid_c, mask=pid_c > -1, other=0)
-        c_off = torch.load(chunk_offsets_ptr + pid_c, mask=pid_c > -1, other=0)
+        c_idx = tl.load(chunk_indices_ptr + pid_c, mask=pid_c > -1, other=0)
+        c_off = tl.load(chunk_offsets_ptr + pid_c, mask=pid_c > -1, other=0)
 
     pid_h = tl.program_id(axis=2)
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
@@ -206,13 +207,82 @@ def _chunk_scan_fwd_kernel(
     C_ptr += pid_b * stride_C_batch + c_idx * chunk_size * stride_C_seqlen + (
         pid_h // nheads_ngroups_ratio) * stride_C_head
 
-    c_offset_active = False
+    # M-block offsets and prev states
+    #  - logic in next block may override these if there is an active offset
+    offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
+    prev_states_ptr += pid_b * stride_states_batch + c_idx * stride_states_chunk + pid_h * stride_states_head
+
+    # c_offset_active = False
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch + c_idx * chunk_size * stride_seq_idx_seqlen
 
         # if there are init states, we only need seq_idx_m to point
         # what is the current seq_idx
         # - the prev is not needed in this case
+        if HAS_INITSTATES:
+
+            # - need to do this otherwise compilation error
+            if c_off > 0:
+            # if 0 > 0:
+
+                # just need to get the current one
+                # - shouldnt need any guards, since c_off points to leftmost boundary
+                seq_idx_m = tl.load(
+                    seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
+                )
+
+                # - also seq_idx_m should be never 0 if there is offset, 
+                # - but for safety we put a check
+                # - best is to raise an exception otherwise but not sure how in triton
+                # c_offset_active = seq_idx_m > 0
+
+                # - shift m-block by offset
+                # offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
+
+                # - replace prev_states_ptr with init_states
+                # we should never get seq_idx_m < 1, c_offset_active guarntees it
+                prev_states_ptr = initstates_ptr + (seq_idx_m -1) * stride_init_states_batch + pid_h * stride_init_states_head
+                stride_states_hdim = stride_init_states_hdim # override strides
+                stride_states_dstate = stride_init_states_dstate
+
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize,
+                      mask=offs_m < chunk_size,
+                      other=0.0).to(tl.float32)
+
+    # - handle chunk state limit
+    chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
+    if HAS_INITSTATES:
+
+        # have to split this if otherwise compilation will have problems
+        # if c_offset_active:
+        if c_off > 0:
+            # this is the case where the seqlen may end within the current chunk
+            #  .. c_off | .... | c_off + 1
+            c_idx_n = tl.load(
+                chunk_indices_ptr + (pid_c+1), 
+                mask=pid_c > -1 and pid_c < chunk_meta_num, 
+                other=-1, # to trigger different chunk
+            )
+
+            if c_idx_n == c_idx:
+                c_off_n = tl.load(
+                    chunk_offsets_ptr + (pid_c+1), 
+                    mask=pid_c > -1 and pid_c < chunk_meta_num, 
+                    other=0
+                )
+
+                # if its the same chunk index we recalculate the limit
+                # - the min should not be needed, but put in for safety
+                chunk_size_limit = min(c_off_n - c_off, seqlen - c_idx * chunk_size)
+            else:
+                # adjust for the offset
+                chunk_size_limit -= c_off
+
+    if HAS_SEQ_IDX:
+        # - handle seq idx for non offset cases
+        # if not c_offset_active:
+        # if c_off == 0:
         if not HAS_INITSTATES:
             seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen,
                                 mask=c_idx >= 1,
@@ -220,58 +290,6 @@ def _chunk_scan_fwd_kernel(
             seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen,
                                 mask=offs_m < chunk_size_limit,
                                 other=-1)
-        elif c_off > 0:
-            # just need to get the current one
-            # - shouldnt need any guards, since c_off points to leftmost boundary
-            seq_idx_m = tl.load(
-                seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
-            )
-
-            # - also seq_idx_m should be never 0 if there is offset, 
-            # - but for safety we put a check
-            c_offset_active = seq_idx_m > 0
-
-    if not HAS_INITSTATES:
-        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        prev_states_ptr += pid_b * stride_states_batch + c_idx * stride_states_chunk + pid_h * stride_states_head
-    elif c_offset_active:
-        # - shift m-block by offset
-        offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
-
-        # - replace prev_states_ptr with init_states
-        # we should never get seq_idx_m < 1, c_offset_active guarntees it
-        prev_states_ptr = initstates_ptr + (seq_idx_m -1) * stride_init_states_batch + pid_h * stride_init_states_head
-        stride_states_hdim = stride_init_states_hdim # override strides
-        stride_states_dstate = stride_init_states_dstate
-
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize,
-                      mask=offs_m < chunk_size,
-                      other=0.0).to(tl.float32)
-
-    chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
-    if HAS_INITSTATES and c_offset_active:
-        # this is the case where the seqlen may end within the current chunk
-        #  .. c_off | .... | c_off + 1
-        c_idx_n = torch.load(
-            chunk_index_ptr + (pid_c+1), 
-            mask=pid_c > -1 and pid_c < chunk_meta_num, 
-            other=-1, # to trigger different chunk
-        )
-
-        if c_idx_n == c_idx:
-            c_off_n = torch.load(
-                chunk_offsets_ptr + (pid_c+1), 
-                mask=pid_c > -1 and pid_c < chunk_meta_num, 
-                other=0
-            )
-
-            # if its the same chunk index we recalculate the limit
-            # - the min should not be needed, but put in for safety
-            chunk_size_limit = min(c_off_n - c_off, seqlen - c_idx * chunk_size)
-        else:
-            # adjust for the offset
-            chunk_size_limit -= c_off
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
@@ -288,9 +306,15 @@ def _chunk_scan_fwd_kernel(
         prev_states_ptrs = prev_states_ptr + (
             offs_n[None, :] * stride_states_hdim +
             offs_k_dstate[:, None] * stride_states_dstate)
-        if HAS_SEQ_IDX and not HAS_INITSTATES:
-            # - if there is initstates, we will rely on prev_states
-            scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m), 0.0)
+        if HAS_SEQ_IDX:
+
+            # - need to do this otherwise compilation errors
+            if not HAS_INITSTATES:
+                scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m), 0.0)
+            else:
+                # - if there is initstates, we will rely on prev_states, no zeroing
+                #   reqiured.
+                scale_m = tl.exp(dA_cs_m)
         else:
             scale_m = tl.exp(dA_cs_m)
         if BLOCK_SIZE_DSTATE <= 128:
@@ -437,7 +461,7 @@ def _chunk_scan_fwd(cb,
             # with initial states, we need to take care of how 
             # seq_idx crosses the boundaries
             assert batch == 1, "chunk scan only supports initial states with batch 1"
-            assert initial_states.shape == (1, nheads, headdim, dstate)
+            assert initial_states.shape == (seq_idx[0].max()+1, nheads, headdim, dstate)
 
             # extra = 0
             p = 0
@@ -456,9 +480,6 @@ def _chunk_scan_fwd(cb,
 
             chunk_indices = torch.tensor(chunk_indices, dtype=torch.int, device=seq_idx.device)
             chunk_offsets = torch.tensor(chunk_offsets, dtype=torch.int, device=seq_idx.device)
-
-            # compute a map
-            import pdb; pdb.set_trace()
 
     # Allocates output.
     out = torch.empty(batch,
@@ -502,7 +523,7 @@ def _chunk_scan_fwd(cb,
         initial_states,
         chunk_indices,
         chunk_offsets,
-        len(chunk_indices),
+        len(chunk_indices) if chunk_indices is not None else 0,
         chunk_size,
         headdim,
         dstate,
@@ -545,6 +566,12 @@ def _chunk_scan_fwd(cb,
         states.stride(2),
         states.stride(3),
         states.stride(4),
+        *(
+            (
+                initial_states.stride(0), initial_states.stride(1),
+                initial_states.stride(2), initial_states.stride(3)
+            ) if initial_states is not None else (0, 0, 0, 0)
+        ),
         D.stride(0) if D is not None else 0,
         True,
         D is not None,
