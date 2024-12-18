@@ -249,7 +249,7 @@ def _chunk_scan_fwd_kernel(
             # this is the case where the seqlen may end within the current chunk
             #  .. c_off | .... | c_off + 1
             c_idx_n = tl.load(
-                chunk_offsets_ptr + (pid_c+1), 
+                chunk_indices_ptr + (pid_c+1), 
                 mask=pid_c > -1 and pid_c < chunk_meta_num, other=-1 # to trigger different chunk
             )
             c_off_n = tl.load(
