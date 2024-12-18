@@ -83,7 +83,6 @@ def _debug_kernel(
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
-    # dA_cumsum_ptr += pid_b * stride_dA_cs_batch + c_idx * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
     C_ptr += pid_b * stride_C_batch + c_idx * chunk_size * stride_C_seqlen + (
         pid_h // nheads_ngroups_ratio) * stride_C_head
 
@@ -114,7 +113,7 @@ def _debug_kernel(
         # this is the case where the seqlen may end within the current chunk
         #  .. c_off | .... | c_off + 1
         c_idx_n = tl.load(
-            chunk_offsets_ptr + (pid_c+1), 
+            chunk_indices_ptr + (pid_c+1), 
             mask=pid_c > -1 and pid_c < chunk_meta_num, other=-1 # to trigger different chunk
         )
         c_off_n = tl.load(
@@ -124,6 +123,13 @@ def _debug_kernel(
         if c_idx == c_idx_n:
             chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
 
+    # if pid_bc == 0:
+    #     chunk_size_limit = 8
+    # else:
+    #     chunk_size_limit = 16
+
+    # if pid_h == 0:
+    #     print ("chunk_size_limit", chunk_size_limit)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
