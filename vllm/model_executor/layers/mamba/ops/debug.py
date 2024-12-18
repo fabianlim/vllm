@@ -114,20 +114,25 @@ def _debug_kernel(
         #  .. c_off | .... | c_off + 1
         c_idx_n = tl.load(
             chunk_indices_ptr + (pid_c+1), 
-            mask=pid_c > -1 and pid_c < chunk_meta_num, other=-1 # to trigger different chunk
+            mask=pid_c > -1 and (pid_c + 1) < chunk_meta_num, other=-1 # to trigger different chunk
         )
         c_off_n = tl.load(
             chunk_offsets_ptr + (pid_c+1), 
-            mask=pid_c > -1 and pid_c < chunk_meta_num, other=chunk_size
+            mask=pid_c > -1 and (pid_c+1) < chunk_meta_num, other=chunk_size
         )
         if c_idx == c_idx_n:
             chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
+
+        if pid_h == 0 and pid_bc == 1:
+            print("pid_c", pid_c)
+            print("c_idx_n", c_idx_n)
+            print("c_off_n", c_off_n)
+            print ("chunk_size_limit", chunk_size_limit)
 
     # if pid_bc == 0:
     #     chunk_size_limit = 8
     # else:
     #     chunk_size_limit = 16
-
     # if pid_h == 0:
     #     print ("chunk_size_limit", chunk_size_limit)
 
@@ -209,6 +214,8 @@ def _debug(
 
             chunk_indices = torch.tensor(chunk_indices, dtype=torch.int, device=seq_idx.device)
             chunk_offsets = torch.tensor(chunk_offsets, dtype=torch.int, device=seq_idx.device)
+            print ("chunk_indices", chunk_indices)
+            print ("chunk_offsets", chunk_offsets)
 
     # Allocates output.
     out = torch.empty(batch,

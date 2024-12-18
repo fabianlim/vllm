@@ -210,8 +210,8 @@ def _chunk_scan_fwd_kernel(
             )
             chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
 
-            if pid_h == 0:
-                print ("chunk_size_limit", chunk_size_limit)
+            # if pid_h == 0:
+            #     print ("chunk_size_limit", chunk_size_limit)
                 # print ("pid_bc", pid_bc)
                 # print ("batch", batch)
                 # print ("pid_bc // batch", pid_bc // batch)
@@ -356,7 +356,12 @@ def _chunk_scan_fwd(cb,
     else:
         out_x = None
 
-    
+    # if initial_states is not None:
+    #     torch.save(
+    #         (cb, x, dt, dA_cumsum, C, states, D, z, seq_idx, initial_states),
+    #         'debug.pt'
+    #     )
+    #     import pdb; pdb.set_trace()
     grid = lambda META: (triton.cdiv(
         chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(
             headdim, META['BLOCK_SIZE_N']), 

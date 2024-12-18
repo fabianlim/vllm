@@ -138,8 +138,8 @@ def _mamba_chunk_scan_combined_fwd(x,
         initial_states=initial_states,
         )
 
-    if initial_states is not None:
-        import pdb; pdb.set_trace()
+    # if initial_states is not None:
+    #     import pdb; pdb.set_trace()
     if cu_seqlens is None:
         return out, out_x, dt, dA_cumsum, states, final_states
     else:
