@@ -248,12 +248,16 @@ def _chunk_scan_fwd_kernel(
         if (c_idx == 0 and c_off == 0) or c_off > 0:
             # this is the case where the seqlen may end within the current chunk
             #  .. c_off | .... | c_off + 1
+            c_idx_n = tl.load(
+                chunk_offsets_ptr + (pid_c+1), 
+                mask=pid_c > -1 and pid_c < chunk_meta_num, other=-1 # to trigger different chunk
+            )
             c_off_n = tl.load(
                 chunk_offsets_ptr + (pid_c+1), 
-                mask=pid_c > -1 and pid_c < chunk_meta_num, 
-            other=chunk_size
+                mask=pid_c > -1 and pid_c < chunk_meta_num, other=chunk_size
             )
-            chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
+            if c_idx == c_idx_n:
+                chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
 
             # need to get the cs at the offset boundary
             dA_cs_m_boundary = tl.load(
