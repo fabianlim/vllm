@@ -15,92 +15,12 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
     configs=[
         triton.Config(
             {
-                'BLOCK_SIZE_M': 128,
-                'BLOCK_SIZE_N': 256,
-                'BLOCK_SIZE_K': 64
+                'BLOCK_SIZE_M': 16,
+                'BLOCK_SIZE_N': 16,
+                'BLOCK_SIZE_K': 16 
             },
-            num_stages=3,
-            num_warps=8),
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': 64,
-                'BLOCK_SIZE_N': 256,
-                'BLOCK_SIZE_K': 32
-            },
-            num_stages=4,
-            num_warps=4),
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': 128,
-                'BLOCK_SIZE_N': 128,
-                'BLOCK_SIZE_K': 32
-            },
-            num_stages=4,
-            num_warps=4),
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': 128,
-                'BLOCK_SIZE_N': 64,
-                'BLOCK_SIZE_K': 32
-            },
-            num_stages=4,
-            num_warps=4),
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': 64,
-                'BLOCK_SIZE_N': 128,
-                'BLOCK_SIZE_K': 32
-            },
-            num_stages=4,
-            num_warps=4),
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': 128,
-                'BLOCK_SIZE_N': 64,
-                'BLOCK_SIZE_K': 64
-            },
-            num_stages=4,
-            num_warps=4),
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': 64,
-                'BLOCK_SIZE_N': 128,
-                'BLOCK_SIZE_K': 64
-            },
-            num_stages=4,
-            num_warps=4),
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': 128,
-                'BLOCK_SIZE_N': 32,
-                'BLOCK_SIZE_K': 32
-            },
-            num_stages=4,
-            num_warps=4),
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': 64,
-                'BLOCK_SIZE_N': 32,
-                'BLOCK_SIZE_K': 32
-            },
-            num_stages=5,
-            num_warps=2),
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': 32,
-                'BLOCK_SIZE_N': 64,
-                'BLOCK_SIZE_K': 32
-            },
-            num_stages=5,
-            num_warps=2),
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': 64,
-                'BLOCK_SIZE_N': 64,
-                'BLOCK_SIZE_K': 32
-            },
-            num_stages=4,
-            num_warps=2),
+            num_stages=1,
+            num_warps=1),
     ],
     key=['chunk_size', 'hdim', 'dstate', 'IS_CAUSAL'],
 )
@@ -184,9 +104,12 @@ def _chunk_scan_fwd_kernel(
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
 ):
-    pid_bc = tl.program_id(axis=1).to(tl.int64)
+    # pid_bc = tl.program_id(axis=1).to(tl.int64)
+    pid_bc = tl.program_id(axis=1)
     pid_c = pid_bc // batch
     pid_b = pid_bc - pid_c * batch
+    pid_h = tl.program_id(axis=2)
+    
     if not HAS_INITSTATES:
         c_idx = pid_c
         # c_off = tl.zeros((1,), dtype=tl.int32)
@@ -195,7 +118,6 @@ def _chunk_scan_fwd_kernel(
         c_idx = tl.load(chunk_indices_ptr + pid_c, mask=pid_c > -1, other=0)
         c_off = tl.load(chunk_offsets_ptr + pid_c, mask=pid_c > -1, other=0)
 
-    pid_h = tl.program_id(axis=2)
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
@@ -223,8 +145,7 @@ def _chunk_scan_fwd_kernel(
         # - the prev is not needed in this case
         if HAS_INITSTATES:
 
-            # - need to do this otherwise compilation error
-            if c_off > 0:
+            if (c_idx == 0 and c_off == 0) or c_off > 0:
             # if 0 > 0:
 
                 # just need to get the current one
@@ -233,19 +154,10 @@ def _chunk_scan_fwd_kernel(
                     seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
                 )
 
-                # - also seq_idx_m should be never 0 if there is offset, 
-                # - but for safety we put a check
-                # - best is to raise an exception otherwise but not sure how in triton
-                # c_offset_active = seq_idx_m > 0
-
-                # - shift m-block by offset
-                # offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
-
                 # - replace prev_states_ptr with init_states
                 # we should never get seq_idx_m < 1, c_offset_active guarntees it
-                prev_states_ptr = initstates_ptr + (seq_idx_m -1) * stride_init_states_batch + pid_h * stride_init_states_head
-                # stride_states_hdim = stride_init_states_hdim # override strides
-                # stride_states_dstate = stride_init_states_dstate
+                prev_states_ptr = initstates_ptr + (seq_idx_m) * stride_init_states_batch + pid_h * stride_init_states_head
+                # prev_states_ptr = initstates_ptr + 0 * stride_init_states_batch + pid_h * stride_init_states_head
                 prev_states_hdim = stride_init_states_hdim # override strides
                 prev_states_dstate = stride_init_states_dstate
 
@@ -255,45 +167,57 @@ def _chunk_scan_fwd_kernel(
                       other=0.0).to(tl.float32)
 
     # - handle chunk state limit
+    # chunk_size_limit = 8
     chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
     if HAS_INITSTATES:
 
         # have to split this if otherwise compilation will have problems
-        # if c_offset_active:
-        if c_off > 0:
+        if (c_idx == 0 and c_off == 0) or c_off > 0:
             # this is the case where the seqlen may end within the current chunk
             #  .. c_off | .... | c_off + 1
-            c_idx_n = tl.load(
-                chunk_indices_ptr + (pid_c+1), 
+            # c_idx_n = tl.load(
+            #     chunk_indices_ptr + (pid_c+1), 
+            #     mask=pid_c > -1 and pid_c < chunk_meta_num, 
+            #     other=-1, # to trigger different chunk
+            # )
+
+
+            # if c_idx_n == c_idx:
+            #     c_off_n = tl.load(
+            #         chunk_offsets_ptr + (pid_c+1), 
+            #         mask=pid_c > -1 and pid_c < chunk_meta_num, 
+            #         other=0
+            #     )
+
+            #     # if its the same chunk index we recalculate the limit
+            #     # - the min should not be needed, but put in for safety
+            #     # chunk_size_limit = min(c_off_n - c_off, seqlen - c_idx * chunk_size)
+            #     chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
+            #     # if pid_h == 0:
+            #     #     print ("c_off_1", c_off)
+
+            # else:
+            #     # adjust for the offset
+            #     chunk_size_limit -= c_off
+            #     # if pid_h == 0:
+            #     #     print ("c_off_2", c_off)
+
+            
+            c_off_n = tl.load(
+                chunk_offsets_ptr + (pid_c+1), 
                 mask=pid_c > -1 and pid_c < chunk_meta_num, 
-                other=-1, # to trigger different chunk
+                other=chunk_size
             )
+            chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
 
-            if c_idx_n == c_idx:
-                c_off_n = tl.load(
-                    chunk_offsets_ptr + (pid_c+1), 
-                    mask=pid_c > -1 and pid_c < chunk_meta_num, 
-                    other=0
-                )
+            if pid_h == 0:
+                print ("chunk_size_limit", chunk_size_limit)
+                # print ("pid_bc", pid_bc)
+                # print ("batch", batch)
+                # print ("pid_bc // batch", pid_bc // batch)
+                # print ("c_idx", c_idx)
+                # print ("pid_c", pid_c)
 
-                # if its the same chunk index we recalculate the limit
-                # - the min should not be needed, but put in for safety
-                chunk_size_limit = min(c_off_n - c_off, seqlen - c_idx * chunk_size)
-            else:
-                # adjust for the offset
-                chunk_size_limit -= c_off
-
-    if HAS_SEQ_IDX:
-        # - handle seq idx for non offset cases
-        # if not c_offset_active:
-        # if c_off == 0:
-        if not HAS_INITSTATES:
-            seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen,
-                                mask=c_idx >= 1,
-                                other=0)
-            seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen,
-                                mask=offs_m < chunk_size_limit,
-                                other=-1)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
@@ -310,17 +234,8 @@ def _chunk_scan_fwd_kernel(
         prev_states_ptrs = prev_states_ptr + (
             offs_n[None, :] * prev_states_hdim +
             offs_k_dstate[:, None] * prev_states_dstate)
-        if HAS_SEQ_IDX:
 
-            # - need to do this otherwise compilation errors
-            if not HAS_INITSTATES:
-                scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m), 0.0)
-            else:
-                # - if there is initstates, we will rely on prev_states, no zeroing
-                #   reqiured.
-                scale_m = tl.exp(dA_cs_m)
-        else:
-            scale_m = tl.exp(dA_cs_m)
+        scale_m = tl.exp(dA_cs_m)
         if BLOCK_SIZE_DSTATE <= 128:
             C = tl.load(C_ptrs,
                         mask=(offs_m[:, None] < chunk_size_limit) &
@@ -333,6 +248,13 @@ def _chunk_scan_fwd_kernel(
                                   other=0.0)
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc = tl.dot(C, prev_states) * scale_m[:, None]
+            # if pid_h == 0 and pid_bc == 1:
+            #     print ("C", C)
+            #     print ("offs_m", offs_m)
+            #     print ("chunk_size_limit", chunk_size_limit)
+            #     # print ("prev_states", prev_states)
+            #     # print ("scale_m", scale_m)
+            #     # print ("acc", acc)
         else:
             for k in range(0, dstate, BLOCK_SIZE_K):
                 C = tl.load(C_ptrs,
@@ -351,77 +273,8 @@ def _chunk_scan_fwd_kernel(
                 prev_states_ptrs += BLOCK_SIZE_K
             acc *= scale_m[:, None]
 
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    cb_ptrs = cb_ptr + (offs_m[:, None] * stride_cb_csize_m +
-                        offs_k[None, :] * stride_cb_csize_k)
-    x_ptrs = x_ptr + (offs_k[:, None] * stride_x_seqlen +
-                      offs_n[None, :] * stride_x_hdim)
-    dt_ptrs = dt_ptr + offs_k * stride_dt_csize
-    dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
-    K_MAX = chunk_size_limit if not IS_CAUSAL else min(
-        (pid_m + 1) * BLOCK_SIZE_M, chunk_size_limit)
-    for k in range(0, K_MAX, BLOCK_SIZE_K):
-        cb = tl.load(cb_ptrs,
-                     mask=(offs_m[:, None] < chunk_size) &
-                     (offs_k[None, :] < chunk_size - k),
-                     other=0.0).to(tl.float32)
-        dA_cs_k = tl.load(dA_cumsum_ptrs,
-                          mask=offs_k < chunk_size - k,
-                          other=0.0).to(tl.float32)
-        # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
-        # So we don't need masking wrt seq_idx here.
-        cb *= tl.exp(dA_cs_m[:, None] - dA_cs_k[None, :])
-        dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k,
-                       other=0.0).to(tl.float32)
-        cb *= dt_k
-        if IS_CAUSAL:
-            mask = offs_m[:, None] >= k + offs_k[None, :]
-            cb = tl.where(mask, cb, 0.0)
-        cb = cb.to(x_ptr.dtype.element_ty)
-        x = tl.load(x_ptrs,
-                    mask=(offs_k[:, None] < chunk_size_limit - k) &
-                    (offs_n[None, :] < hdim),
-                    other=0.0)
-        acc += tl.dot(cb, x)
-        cb_ptrs += BLOCK_SIZE_K * stride_cb_csize_k
-        x_ptrs += BLOCK_SIZE_K * stride_x_seqlen
-        dt_ptrs += BLOCK_SIZE_K * stride_dt_csize
-        dA_cumsum_ptrs += BLOCK_SIZE_K * stride_dA_cs_csize
-
-    offs_out_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_out_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
     offs_out_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-    if HAS_D:
-        if D_HAS_HDIM:
-            D = tl.load(D_ptr + pid_h * stride_D_head + offs_n,
-                        mask=offs_n < hdim,
-                        other=0.0).to(tl.float32)
-        else:
-            D = tl.load(D_ptr + pid_h * stride_D_head).to(tl.float32)
-        x_residual = tl.load(x_ptr + (offs_m[:, None] * stride_x_seqlen +
-                                      offs_n[None, :] * stride_x_hdim),
-                             mask=(offs_m[:, None] < chunk_size_limit) &
-                             (offs_n[None, :] < hdim),
-                             other=0.0).to(tl.float32)
-        acc += x_residual * D
-
-    if HAS_Z:
-        out_x_ptr += pid_b * stride_out_batch + c_idx * chunk_size * stride_out_seqlen + pid_h * stride_out_head
-        out_x_ptrs = out_x_ptr + (stride_out_seqlen * offs_out_m[:, None] +
-                                  offs_out_n[None, :])
-        tl.store(out_x_ptrs,
-                 acc,
-                 mask=(offs_out_m[:, None] < chunk_size_limit) &
-                 (offs_out_n[None, :] < hdim))
-
-        z_ptr += pid_b * stride_z_batch + c_idx * chunk_size * stride_z_seqlen + pid_h * stride_z_head
-        z_ptrs = z_ptr + (stride_z_seqlen * offs_out_m[:, None] +
-                          stride_z_hdim * offs_out_n[None, :])
-        z = tl.load(z_ptrs,
-                    mask=(offs_out_m[:, None] < chunk_size_limit) &
-                    (offs_out_n[None, :] < hdim),
-                    other=0.0).to(tl.float32)
-        acc *= z * tl.sigmoid(z)
 
     out_ptr += pid_b * stride_out_batch + c_idx * chunk_size * stride_out_seqlen + pid_h * stride_out_head
     out_ptrs = out_ptr + (stride_out_seqlen * offs_out_m[:, None] +
