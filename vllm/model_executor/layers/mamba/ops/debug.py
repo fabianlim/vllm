@@ -71,18 +71,13 @@ def _debug_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
-    HAS_INITSTATES: tl.constexpr,
 ):
     pid_bc = tl.program_id(axis=1).to(tl.int64)
     # pid_bc = tl.program_id(axis=1)
     pid_c = pid_bc // batch
     pid_b = pid_bc - pid_c * batch
-    if not HAS_INITSTATES:
-        c_idx = pid_c
-        c_off = 0
-    else:
-        c_idx = tl.load(chunk_indices_ptr + pid_c, mask=pid_c > -1, other=0)
-        c_off = tl.load(chunk_offsets_ptr + pid_c, mask=pid_c > -1, other=0)
+    c_idx = tl.load(chunk_indices_ptr + pid_c, mask=pid_c > -1, other=0)
+    c_off = tl.load(chunk_offsets_ptr + pid_c, mask=pid_c > -1, other=0)
 
     pid_h = tl.program_id(axis=2)
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
@@ -104,20 +99,19 @@ def _debug_kernel(
     # if there are init states, we only need seq_idx_m to point
     # what is the current seq_idx
     # - the prev is not needed in this case
-    if HAS_INITSTATES:
 
-        if (c_idx == 0 and c_off == 0) or c_off > 0:
+    if (c_idx == 0 and c_off == 0) or c_off > 0:
 
-            # just need to get the current one
-            # - shouldnt need any guards, since c_off points to leftmost boundary
-            seq_idx_m = tl.load(
-                seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
-            )
+        # just need to get the current one
+        # - shouldnt need any guards, since c_off points to leftmost boundary
+        seq_idx_m = tl.load(
+            seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
+        )
 
-            # - replace prev_states_ptr with init_states
-            prev_states_ptr = initstates_ptr + seq_idx_m * stride_init_states_batch + pid_h * stride_init_states_head
-            prev_states_hdim = stride_init_states_hdim # override strides
-            prev_states_dstate = stride_init_states_dstate
+        # - replace prev_states_ptr with init_states
+        prev_states_ptr = initstates_ptr + seq_idx_m * stride_init_states_batch + pid_h * stride_init_states_head
+        prev_states_hdim = stride_init_states_hdim # override strides
+        prev_states_dstate = stride_init_states_dstate
 
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize,
@@ -126,29 +120,28 @@ def _debug_kernel(
 
     # - handle chunk state limit
     chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
-    if HAS_INITSTATES:
 
-        # have to split this if otherwise compilation will have problems
-        dA_cs_m_boundary = 0.0
-        if (c_idx == 0 and c_off == 0) or c_off > 0:
-            # this is the case where the seqlen may end within the current chunk
-            #  .. c_off | .... | c_off + 1
-            c_idx_n = tl.load(
-                chunk_offsets_ptr + (pid_c+1), 
-                mask=pid_c > -1 and pid_c < chunk_meta_num, other=-1 # to trigger different chunk
-            )
-            c_off_n = tl.load(
-                chunk_offsets_ptr + (pid_c+1), 
-                mask=pid_c > -1 and pid_c < chunk_meta_num, other=chunk_size
-            )
-            if c_idx == c_idx_n:
-                chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
+    # have to split this if otherwise compilation will have problems
+    dA_cs_m_boundary = 0.0
+    if (c_idx == 0 and c_off == 0) or c_off > 0:
+        # this is the case where the seqlen may end within the current chunk
+        #  .. c_off | .... | c_off + 1
+        c_idx_n = tl.load(
+            chunk_offsets_ptr + (pid_c+1), 
+            mask=pid_c > -1 and pid_c < chunk_meta_num, other=-1 # to trigger different chunk
+        )
+        c_off_n = tl.load(
+            chunk_offsets_ptr + (pid_c+1), 
+            mask=pid_c > -1 and pid_c < chunk_meta_num, other=chunk_size
+        )
+        if c_idx == c_idx_n:
+            chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
 
-            # need to get the cs at the offset boundary
-            dA_cs_m_boundary = tl.load(
-                dA_cumsum_ptr + (pid_m * BLOCK_SIZE_M + c_off -1) * stride_dA_cs_csize,
-                mask=(pid_m * BLOCK_SIZE_M + c_off) > 0,
-                other=0.0).to(tl.float32)
+        # need to get the cs at the offset boundary
+        dA_cs_m_boundary = tl.load(
+            dA_cumsum_ptr + (pid_m * BLOCK_SIZE_M + c_off -1) * stride_dA_cs_csize,
+            mask=(pid_m * BLOCK_SIZE_M + c_off) > 0,
+            other=0.0).to(tl.float32)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
@@ -158,7 +151,8 @@ def _debug_kernel(
     if IS_TRITON_22 or c_idx > -1:
         # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
         offs_k_dstate = tl.arange(
-            0, BLOCK_SIZE_DSTATE if BLOCK_SIZE_DSTATE <= 128 else BLOCK_SIZE_K)
+            0, BLOCK_SIZE_DSTATE 
+        )
         C_ptrs = C_ptr + (offs_m[:, None] * stride_C_seqlen +
                           offs_k_dstate[None, :] * stride_C_dstate)
         
@@ -167,20 +161,19 @@ def _debug_kernel(
             offs_k_dstate[:, None] * prev_states_dstate)
 
         scale_m = tl.exp(dA_cs_m)
-        if BLOCK_SIZE_DSTATE <= 128:
-            C = tl.load(C_ptrs,
-                        mask=(offs_m[:, None] < chunk_size_limit) &
-                        (offs_k_dstate[None, :] < dstate),
-                        other=0.0)
-                        
-            prev_states = tl.load(prev_states_ptrs,
-                                  mask=(offs_k_dstate[:, None] < dstate) &
-                                  (offs_n[None, :] < hdim),
-                                  other=0.0)
-            prev_states = prev_states.to(C_ptr.dtype.element_ty)
-            acc = tl.dot(C, prev_states) 
-            if pid_h == 0 and pid_bc == 1:
-                print ("prev_states", prev_states)
+        C = tl.load(C_ptrs,
+                    mask=(offs_m[:, None] < chunk_size_limit) &
+                    (offs_k_dstate[None, :] < dstate),
+                    other=0.0)
+                    
+        prev_states = tl.load(prev_states_ptrs,
+                                mask=(offs_k_dstate[:, None] < dstate) &
+                                (offs_n[None, :] < hdim),
+                                other=0.0)
+        prev_states = prev_states.to(C_ptr.dtype.element_ty)
+        acc = tl.dot(C, prev_states) 
+        # if pid_h == 0 and pid_bc == 1:
+        #     print ("prev_states", prev_states)
 
     offs_out_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
     offs_out_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -293,6 +286,5 @@ def _debug(
         True,
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         IS_TRITON_22=TRITON_22,
-        HAS_INITSTATES=initial_states is not None,
     )
     return out
