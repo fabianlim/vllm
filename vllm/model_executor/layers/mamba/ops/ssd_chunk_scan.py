@@ -250,11 +250,11 @@ def _chunk_scan_fwd_kernel(
             #  .. c_off | .... | c_off + 1
             c_idx_n = tl.load(
                 chunk_indices_ptr + (pid_c+1), 
-                mask=pid_c > -1 and pid_c < chunk_meta_num, other=-1 # to trigger different chunk
+                mask=pid_c > -1 and (pid_c+1) < chunk_meta_num, other=-1 # to trigger different chunk
             )
             c_off_n = tl.load(
                 chunk_offsets_ptr + (pid_c+1), 
-                mask=pid_c > -1 and pid_c < chunk_meta_num, other=chunk_size
+                mask=pid_c > -1 and (pid_c+1) < chunk_meta_num, other=chunk_size
             )
             if c_idx == c_idx_n:
                 chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
