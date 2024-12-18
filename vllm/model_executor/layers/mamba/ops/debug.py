@@ -90,28 +90,19 @@ def _debug_kernel(
     # M-block offsets and prev states
     #  - logic in next block may override these if there is an active offset
     offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
-    prev_states_ptr = states_ptr + pid_b * stride_states_batch + c_idx * stride_states_chunk + pid_h * stride_states_head
-    prev_states_hdim = stride_states_hdim 
-    prev_states_dstate = stride_states_dstate
-
     seq_idx_ptr += pid_b * stride_seq_idx_batch + c_idx * chunk_size * stride_seq_idx_seqlen
 
-    # if there are init states, we only need seq_idx_m to point
-    # what is the current seq_idx
-    # - the prev is not needed in this case
 
-    if (c_idx == 0 and c_off == 0) or c_off > 0:
+    # just need to get the current one
+    # - shouldnt need any guards, since c_off points to leftmost boundary
+    seq_idx_m = tl.load(
+        seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
+    )
 
-        # just need to get the current one
-        # - shouldnt need any guards, since c_off points to leftmost boundary
-        seq_idx_m = tl.load(
-            seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
-        )
-
-        # - replace prev_states_ptr with init_states
-        prev_states_ptr = initstates_ptr + seq_idx_m * stride_init_states_batch + pid_h * stride_init_states_head
-        prev_states_hdim = stride_init_states_hdim # override strides
-        prev_states_dstate = stride_init_states_dstate
+    # - replace prev_states_ptr with init_states
+    prev_states_ptr = initstates_ptr + seq_idx_m * stride_init_states_batch + pid_h * stride_init_states_head
+    prev_states_hdim = stride_init_states_hdim # override strides
+    prev_states_dstate = stride_init_states_dstate
 
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
@@ -136,34 +127,30 @@ def _debug_kernel(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    # Without the if (pid_c > -1), with Triton 2.1.0, I get
-    # Assertion `!(srcMmaLayout && dstMmaLayout) && "Unexpected mma -> mm a layout conversion"' failed.
-    # With Triton 2.2.0, this works
-    if IS_TRITON_22 or c_idx > -1:
-        # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
-        offs_k_dstate = tl.arange(
-            0, BLOCK_SIZE_DSTATE 
-        )
-        C_ptrs = C_ptr + (offs_m[:, None] * stride_C_seqlen +
-                          offs_k_dstate[None, :] * stride_C_dstate)
-        
-        prev_states_ptrs = prev_states_ptr + (
-            offs_n[None, :] * prev_states_hdim +
-            offs_k_dstate[:, None] * prev_states_dstate)
+    # Faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
+    offs_k_dstate = tl.arange(
+        0, BLOCK_SIZE_DSTATE 
+    )
+    C_ptrs = C_ptr + (offs_m[:, None] * stride_C_seqlen +
+                        offs_k_dstate[None, :] * stride_C_dstate)
+    
+    prev_states_ptrs = prev_states_ptr + (
+        offs_n[None, :] * prev_states_hdim +
+        offs_k_dstate[:, None] * prev_states_dstate)
 
-        C = tl.load(C_ptrs,
-                    mask=(offs_m[:, None] < chunk_size_limit) &
-                    (offs_k_dstate[None, :] < dstate),
-                    other=0.0)
-                    
-        prev_states = tl.load(prev_states_ptrs,
-                                mask=(offs_k_dstate[:, None] < dstate) &
-                                (offs_n[None, :] < hdim),
-                                other=0.0)
-        prev_states = prev_states.to(C_ptr.dtype.element_ty)
-        acc = tl.dot(C, prev_states) 
-        # if pid_h == 0 and pid_bc == 1:
-        #     print ("prev_states", prev_states)
+    C = tl.load(C_ptrs,
+                mask=(offs_m[:, None] < chunk_size_limit) &
+                (offs_k_dstate[None, :] < dstate),
+                other=0.0)
+                
+    prev_states = tl.load(prev_states_ptrs,
+                            mask=(offs_k_dstate[:, None] < dstate) &
+                            (offs_n[None, :] < hdim),
+                            other=0.0)
+    prev_states = prev_states.to(C_ptr.dtype.element_ty)
+    acc = tl.dot(C, prev_states) 
+    # if pid_h == 0 and pid_bc == 1:
+    #     print ("prev_states", prev_states)
 
     offs_out_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
     offs_out_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
