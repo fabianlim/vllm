@@ -17,7 +17,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             {
                 'BLOCK_SIZE_M': 16,
                 'BLOCK_SIZE_N': 16,
-                'BLOCK_SIZE_K': 16
+                # 'BLOCK_SIZE_K': 16
             },
             num_stages=1,
             num_warps=1),
@@ -26,18 +26,11 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 )
 @triton.jit
 def _debug_kernel(
-    # Pointers to matrices
-    # cb_ptr,
-    # x_ptr,
-    # z_ptr,
     out_ptr,
-    # out_x_ptr,
-    # dt_ptr,
     dA_cumsum_ptr,
     seq_idx_ptr,
     C_ptr,
     states_ptr,
-    # D_ptr,
     initstates_ptr,
     chunk_indices_ptr,
     chunk_offsets_ptr,
@@ -49,28 +42,10 @@ def _debug_kernel(
     batch,
     seqlen,
     nheads_ngroups_ratio,
-    # Strides
-    # stride_cb_batch,
-    # stride_cb_chunk,
-    # stride_cb_head,
-    # stride_cb_csize_m,
-    # stride_cb_csize_k,
-    # stride_x_batch,
-    # stride_x_seqlen,
-    # stride_x_head,
-    # stride_x_hdim,
-    # stride_z_batch,
-    # stride_z_seqlen,
-    # stride_z_head,
-    # stride_z_hdim,
     stride_out_batch,
     stride_out_seqlen,
     stride_out_head,
     stride_out_hdim,
-    # stride_dt_batch,
-    # stride_dt_chunk,
-    # stride_dt_head,
-    # stride_dt_csize,
     stride_dA_cs_batch,
     stride_dA_cs_chunk,
     stride_dA_cs_head,
@@ -90,15 +65,10 @@ def _debug_kernel(
     stride_init_states_head,
     stride_init_states_hdim,
     stride_init_states_dstate,
-    # stride_D_head,
     # Meta-parameters
     IS_CAUSAL: tl.constexpr,
-    # HAS_D: tl.constexpr,
-    # D_HAS_HDIM: tl.constexpr,
-    # HAS_Z: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
@@ -225,29 +195,14 @@ def _debug_kernel(
 
 
 def _debug(
-    # cb,
-    # x,
-    # dt,
     dA_cumsum,
     C,
     states,
-    # D=None,
-    # z=None,
     seq_idx=None,
     initial_states=None,
 ):
     (batch, seqlen, ngroups, dstate) = C.shape
-    # batch, seqlen, nheads, headdim = x.shape
-    # _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = C.shape
-    # assert nheads % ngroups == 0
-    # assert C.shape == (batch, seqlen, ngroups, dstate)
-    # assert cb.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)
-    # if z is not None:
-    #     assert z.shape == x.shape
-    # if D is not None:
-    #     assert D.shape == (nheads, headdim) or D.shape == (nheads, )
-    # assert dt.shape == (batch, nheads, nchunks, chunk_size)
     (batch, nheads, nchunks, chunk_size) = dA_cumsum.shape
     (batch, nchunks, nheads, headdim, dstate) = states.shape 
 
@@ -294,20 +249,12 @@ def _debug(
             batch * nchunks if chunk_offsets is None else len(chunk_offsets),
             nheads
         )
-    # z_strides = ((z.stride(0), z.stride(1), z.stride(2),
-    #               z.stride(3)) if z is not None else (0, 0, 0, 0))
     _debug_kernel[grid](
-        # cb,
-        # x,
-        # z,
         out,
-        # out_x,
-        # dt,
         dA_cumsum,
         seq_idx,
         C,
         states,
-        # D,
         initial_states,
         chunk_indices,
         chunk_offsets,
@@ -318,27 +265,10 @@ def _debug(
         batch,
         seqlen,
         nheads // ngroups,
-        # cb.stride(0),
-        # cb.stride(1),
-        # cb.stride(2),
-        # cb.stride(3),
-        # cb.stride(4),
-        # x.stride(0),
-        # x.stride(1),
-        # x.stride(2),
-        # x.stride(3),
-        # z_strides[0],
-        # z_strides[1],
-        # z_strides[2],
-        # z_strides[3],
         out.stride(0),
         out.stride(1),
         out.stride(2),
         out.stride(3),
-        # dt.stride(0),
-        # dt.stride(2),
-        # dt.stride(1),
-        # dt.stride(3),
         dA_cumsum.stride(0),
         dA_cumsum.stride(2),
         dA_cumsum.stride(1),
@@ -360,12 +290,8 @@ def _debug(
                 initial_states.stride(2), initial_states.stride(3)
             ) if initial_states is not None else (0, 0, 0, 0)
         ),
-        # D.stride(0) if D is not None else 0,
         True,
-        # D is not None,
-        # D.dim() == 2 if D is not None else True,
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
-        #HAS_Z=z is not None,
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
     )
