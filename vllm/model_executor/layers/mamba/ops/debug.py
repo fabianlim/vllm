@@ -27,7 +27,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 @triton.jit
 def _debug_kernel(
     out_ptr,
-    dA_cumsum_ptr,
+    # dA_cumsum_ptr,
     seq_idx_ptr,
     C_ptr,
     states_ptr,
@@ -46,10 +46,10 @@ def _debug_kernel(
     stride_out_seqlen,
     stride_out_head,
     stride_out_hdim,
-    stride_dA_cs_batch,
-    stride_dA_cs_chunk,
-    stride_dA_cs_head,
-    stride_dA_cs_csize,
+    # stride_dA_cs_batch,
+    # stride_dA_cs_chunk,
+    # stride_dA_cs_head,
+    # stride_dA_cs_csize,
     stride_seq_idx_batch,
     stride_seq_idx_seqlen,
     stride_C_batch,
@@ -83,7 +83,7 @@ def _debug_kernel(
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
-    dA_cumsum_ptr += pid_b * stride_dA_cs_batch + c_idx * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
+    # dA_cumsum_ptr += pid_b * stride_dA_cs_batch + c_idx * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
     C_ptr += pid_b * stride_C_batch + c_idx * chunk_size * stride_C_seqlen + (
         pid_h // nheads_ngroups_ratio) * stride_C_head
 
@@ -114,15 +114,11 @@ def _debug_kernel(
         prev_states_dstate = stride_init_states_dstate
 
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize,
-                      mask=offs_m < chunk_size,
-                      other=0.0).to(tl.float32)
 
     # - handle chunk state limit
     chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
 
     # have to split this if otherwise compilation will have problems
-    dA_cs_m_boundary = 0.0
     if (c_idx == 0 and c_off == 0) or c_off > 0:
         # this is the case where the seqlen may end within the current chunk
         #  .. c_off | .... | c_off + 1
@@ -137,11 +133,6 @@ def _debug_kernel(
         if c_idx == c_idx_n:
             chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
 
-        # need to get the cs at the offset boundary
-        dA_cs_m_boundary = tl.load(
-            dA_cumsum_ptr + (pid_m * BLOCK_SIZE_M + c_off -1) * stride_dA_cs_csize,
-            mask=(pid_m * BLOCK_SIZE_M + c_off) > 0,
-            other=0.0).to(tl.float32)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
@@ -160,7 +151,6 @@ def _debug_kernel(
             offs_n[None, :] * prev_states_hdim +
             offs_k_dstate[:, None] * prev_states_dstate)
 
-        scale_m = tl.exp(dA_cs_m)
         C = tl.load(C_ptrs,
                     mask=(offs_m[:, None] < chunk_size_limit) &
                     (offs_k_dstate[None, :] < dstate),
@@ -244,7 +234,7 @@ def _debug(
         )
     _debug_kernel[grid](
         out,
-        dA_cumsum,
+        # dA_cumsum,
         seq_idx,
         C,
         states,
@@ -262,10 +252,10 @@ def _debug(
         out.stride(1),
         out.stride(2),
         out.stride(3),
-        dA_cumsum.stride(0),
-        dA_cumsum.stride(2),
-        dA_cumsum.stride(1),
-        dA_cumsum.stride(3),
+        # dA_cumsum.stride(0),
+        # dA_cumsum.stride(2),
+        # dA_cumsum.stride(1),
+        # dA_cumsum.stride(3),
         *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else
           (0, 0)),
         C.stride(0),
