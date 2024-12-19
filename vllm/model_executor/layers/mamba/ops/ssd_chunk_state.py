@@ -517,7 +517,7 @@ def _chunk_state_varlen_kernel(
         else:
 
             # - this seems repetitve, buts its to help the compiler
-            if start_idx <= pid_c * chunk_size:
+            if start_idx < pid_c * chunk_size:
                 past_states_ptrs = chunk_states_ptr + (
                     offs_m[:, None] * stride_chunk_states_hdim +
                     offs_n[None, :] * stride_chunk_states_dstate)
