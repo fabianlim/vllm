@@ -215,21 +215,27 @@ def _chunk_scan_fwd_kernel(
 
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch + c_idx * chunk_size * stride_seq_idx_seqlen
+        seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen,
+                            mask=c_idx >= 1,
+                            other=0)
 
         # if there are init states, we only need seq_idx_m to point
         # what is the current seq_idx
         # - the prev is not needed in this case
         if HAS_INITSTATES:
 
+            # get current seq idx
+            seq_idx_m = tl.load(
+                seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
+            )
+
             # - recall that in ssd_state_passing, for the case c_idx == c_off == 0
             # i.e., the very first sequence, we made states_ptr hold its inital state
-            if c_off > 0:
-
-                # - if this is an offset, then we need to load the prev state from 
-                #   init states
-                seq_idx_m = tl.load(
-                    seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
-                )
+            # so this edge case is taken care of
+            if (
+                (c_off == 0) and (seq_idx_prev != seq_idx_m) # if a seq is changed exactly on boundary
+                or (c_off > 0) # implies a sequence change
+            ):
 
                 # - replace prev_states_ptr with init_states
                 prev_states_ptr = initstates_ptr + seq_idx_m * stride_init_states_batch + pid_h * stride_init_states_head
@@ -283,16 +289,12 @@ def _chunk_scan_fwd_kernel(
                 other=0.0).to(tl.float32)
 
     if HAS_SEQ_IDX:
-        # - handle seq idx for non offset cases
-        # if not c_offset_active:
-        # if c_off == 0:
+        # - handle seq idx when HAS_INITSTATES==False
         if not HAS_INITSTATES:
-            seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen,
-                                mask=c_idx >= 1,
-                                other=0)
             seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen,
                                 mask=offs_m < chunk_size_limit,
                                 other=-1)
+
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
