@@ -79,12 +79,16 @@ def _state_passing_fwd_kernel(
     out_ptrs = out_ptr + offs_m * stride_out_dim
     final_states_ptrs = final_states_ptr + offs_m * stride_final_states_dim
 
+    # - states will be the past state of the sequence that continues on the current check
     if not HAS_INITSTATES:
         states = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
     else:
         initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
+        # - for cont batches, for the first chunk mean it will be the first batch's
+        #   init state
         states = tl.load(initstates_ptrs, mask=offs_m < dim,
                          other=0.0).to(tl.float32)
+
     tl.store(out_ptrs, states, mask=offs_m < dim)
     out_ptrs += stride_out_chunk
     seq_idx = 0
@@ -103,6 +107,8 @@ def _state_passing_fwd_kernel(
                     # - override the scanned state
                     initstates_ptrs += seq_idx_new * stride_initstates_batch
 
+                    # - if there are init states, we load new states, that is 
+                    #   now continous with the new batch being processed
                     states = tl.load(initstates_ptrs,
                                      mask=offs_m < dim,
                                      other=0.0).to(tl.float32)
@@ -110,9 +116,9 @@ def _state_passing_fwd_kernel(
                     # in the previous scan iteration, the wrong state was
                     # written to the output buffer
                     # - so we also override it
-                    tl.store(out_ptrs - stride_out_chunk,
-                             states,
-                             mask=offs_m < dim)
+                    # tl.store(out_ptrs - stride_out_chunk,
+                    #          states,
+                    #          mask=offs_m < dim)
             else:
                 scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
 

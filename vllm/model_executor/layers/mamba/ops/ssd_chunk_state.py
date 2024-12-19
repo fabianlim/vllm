@@ -496,13 +496,9 @@ def _chunk_state_varlen_kernel(
         dA_cumsum_ptrs += BLOCK_SIZE_K * stride_dA_cs_csize
 
     # If the sequence starts after the last chunk idx, we don't need to add the contribution from the last chunk
-    # - if we are at the first chunk, then the inequality is strict, since the 
-    #   initial state is zero
-    # - otherwise if HAS_INITSTATES=True, then we just need an equality for the edge case
-    #   when the cont batches is allinged chunk boundaries. 
-    #   chunked_state |-> new cont batch chunk \
-    #                 ^
-    #               start_idx == pid * chunk_size 
+    # If HAS_INITSTATES==True need to consider two possiblties
+    # - if start_idx <= pid_c * chunk_size, then we need to take the past_states_ptrs
+    # - if state_dix > pid * chunk_size, then we need to insert initstates
     if (
         (start_idx < pid_c * chunk_size) # first chunk
         or 
@@ -517,17 +513,26 @@ def _chunk_state_varlen_kernel(
             past_states_ptrs = chunk_states_ptr + (
                 offs_m[:, None] * stride_chunk_states_hdim +
                 offs_n[None, :] * stride_chunk_states_dstate)
-            dA_cs_boundary = 0 # in this case start_idx < pid * chunk_size 
+            dA_cs_boundary = 0.0 # in this case start_idx < pid * chunk_size 
         else:
-            past_states_ptrs = initstates_ptr + (
-                pid_b * stride_init_states_batch + 
-                offs_m[:, None] * stride_init_states_hdim +
-                offs_n[None, :] * stride_init_states_dstate)
 
-            if start_idx >  pid_c * chunk_size:
-                dA_cs_boundary = tl.load(
-                    dA_cumsum_ptr + (start_idx - pid_c * chunk_size - 1) *
-                                    stride_dA_cs_csize).to(tl.float32)
+            # - this seems repetitve, buts its to help the compiler
+            if start_idx <= pid_c * chunk_size:
+                past_states_ptrs = chunk_states_ptr + (
+                    offs_m[:, None] * stride_chunk_states_hdim +
+                    offs_n[None, :] * stride_chunk_states_dstate)
+                dA_cs_boundary = 0.0 # in this case start_idx < pid * chunk_size 
+            else:
+                past_states_ptrs = initstates_ptr + (
+                    pid_b * stride_init_states_batch + 
+                    offs_m[:, None] * stride_init_states_hdim +
+                    offs_n[None, :] * stride_init_states_dstate)
+
+                # need to adjust the boundary
+                if start_idx >  pid_c * chunk_size:
+                    dA_cs_boundary = tl.load(
+                        dA_cumsum_ptr + (start_idx - pid_c * chunk_size - 1) *
+                                        stride_dA_cs_csize).to(tl.float32)
 
         past_states = tl.load(past_states_ptrs,
                             mask=(offs_m[:, None] < hdim) &

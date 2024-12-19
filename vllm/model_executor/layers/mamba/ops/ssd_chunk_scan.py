@@ -221,10 +221,12 @@ def _chunk_scan_fwd_kernel(
         # - the prev is not needed in this case
         if HAS_INITSTATES:
 
-            if (c_idx == 0 and c_off == 0) or c_off > 0:
+            # - recall that in ssd_state_passing, for the case c_idx == c_off == 0
+            # i.e., the very first sequence, we made states_ptr hold its inital state
+            if c_off > 0:
 
-                # just need to get the current one
-                # - shouldnt need any guards, since c_off points to leftmost boundary
+                # - if this is an offset, then we need to load the prev state from 
+                #   init states
                 seq_idx_m = tl.load(
                     seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
                 )
@@ -245,21 +247,36 @@ def _chunk_scan_fwd_kernel(
 
         # have to split this if otherwise compilation will have problems
         dA_cs_m_boundary = 0.0
-        if (c_idx == 0 and c_off == 0) or c_off > 0:
-            # this is the case where the seqlen may end within the current chunk
-            #  .. c_off | .... | c_off + 1
-            c_idx_n = tl.load(
-                chunk_indices_ptr + (pid_c+1), 
-                mask=pid_c > -1 and (pid_c+1) < chunk_meta_num, other=-1 # to trigger different chunk
-            )
+
+        # get the c_idx for the next (logica) chunk
+        c_idx_n = tl.load(
+            chunk_indices_ptr + (pid_c+1), 
+            mask=pid_c > -1 and (pid_c+1) < chunk_meta_num, other=-1 # to trigger different chunk
+        )
+
+        # - there are things to consider
+        # A. if c_off > 0 then we need to move the dA_cs bounary to ensure correct 
+        #    contribution of past states
+        # B. if c_off_n < chunk_size_limit, then we need to adjust this so as not to 
+        #    encroach into the next sequence, where c_off_n is the offset of the next 
+        #    (logical) chunk.
+        # An equivalent check for B is c_idx == c_idx_n, where there is repetition in
+        # (logical) chunk indices.
+
+        if (c_idx == c_idx_n) or c_off > 0:
+
+            # get the next offset
             c_off_n = tl.load(
                 chunk_offsets_ptr + (pid_c+1), 
                 mask=pid_c > -1 and (pid_c+1) < chunk_meta_num, other=chunk_size
             )
-            if c_idx == c_idx_n:
-                chunk_size_limit = min(c_off_n, seqlen - c_idx * chunk_size)
 
-            # need to get the cs at the offset boundary
+            # in this case, adjust down the chunk_size_limit
+            if c_idx == c_idx_n:
+                chunk_size_limit = min(c_off_n, chunk_size_limit)
+
+            # get the cs at the offset boundary
+            # - c_off == 0 is a passthrough
             dA_cs_m_boundary = tl.load(
                 dA_cumsum_ptr + (pid_m * BLOCK_SIZE_M + c_off -1) * stride_dA_cs_csize,
                 mask=(pid_m * BLOCK_SIZE_M + c_off -1) > -1,
