@@ -504,16 +504,15 @@ def _chunk_state_varlen_kernel(
         or 
         (
             HAS_INITSTATES 
-            # and (start_idx <= pid_c * chunk_size) 
         )
     ):
 
-        dA_cs_boundary = 0.0 # if start_idx < pid * chunk_size 
+        dA_cs_boundary = 0.0 # default
+
         if not HAS_INITSTATES:
             past_states_ptrs = chunk_states_ptr + (
                 offs_m[:, None] * stride_chunk_states_hdim +
                 offs_n[None, :] * stride_chunk_states_dstate)
-            dA_cs_boundary = 0.0 # in this case start_idx < pid * chunk_size 
         else:
 
             # - this seems repetitve, buts its to help the compiler
@@ -521,7 +520,6 @@ def _chunk_state_varlen_kernel(
                 past_states_ptrs = chunk_states_ptr + (
                     offs_m[:, None] * stride_chunk_states_hdim +
                     offs_n[None, :] * stride_chunk_states_dstate)
-                dA_cs_boundary = 0.0 # in this case start_idx < pid * chunk_size 
             else:
                 past_states_ptrs = initstates_ptr + (
                     pid_b * stride_init_states_batch + 
