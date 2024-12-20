@@ -226,24 +226,23 @@ def _chunk_scan_fwd_kernel(
         if HAS_INITSTATES:
 
             # get current seq idx
-            seq_idx_m = -1
             if (pid_m * BLOCK_SIZE_M + c_off) < chunk_size_limit:
                 seq_idx_m = tl.load(
                     seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen,
                 )
 
-            # - recall that in ssd_state_passing, for the case c_idx == c_off == 0
-            # i.e., the very first sequence, we made states_ptr hold its inital state
-            # so this edge case is taken care of
-            if (
-                (c_off == 0) and (seq_idx_prev != seq_idx_m) # if a seq is changed exactly on boundary
-                or (c_off > 0) # implies a sequence change
-            ):
+                # - recall that in ssd_state_passing, for the case c_idx == c_off == 0
+                # i.e., the very first sequence, we made states_ptr hold its inital state
+                # so this edge case is taken care of
+                if (
+                    (c_off == 0) and (seq_idx_prev != seq_idx_m) # if a seq is changed exactly on boundary
+                    or (c_off > 0) # implies a sequence change
+                ):
 
-                # - replace prev_states_ptr with init_states
-                prev_states_ptr = initstates_ptr + seq_idx_m * stride_init_states_batch + pid_h * stride_init_states_head
-                prev_states_hdim = stride_init_states_hdim # override strides
-                prev_states_dstate = stride_init_states_dstate
+                    # - replace prev_states_ptr with init_states
+                    prev_states_ptr = initstates_ptr + seq_idx_m * stride_init_states_batch + pid_h * stride_init_states_head
+                    prev_states_hdim = stride_init_states_hdim # override strides
+                    prev_states_dstate = stride_init_states_dstate
 
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize,
