@@ -213,6 +213,7 @@ def _chunk_scan_fwd_kernel(
     prev_states_hdim = stride_states_hdim 
     prev_states_dstate = stride_states_dstate
 
+    chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch + c_idx * chunk_size * stride_seq_idx_seqlen
         seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen,
@@ -225,9 +226,11 @@ def _chunk_scan_fwd_kernel(
         if HAS_INITSTATES:
 
             # get current seq idx
-            seq_idx_m = tl.load(
-                seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen
-            )
+            seq_idx_m = -1
+            if (pid_m * BLOCK_SIZE_M + c_off) < chunk_size_limit:
+                seq_idx_m = tl.load(
+                    seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen,
+                )
 
             # - recall that in ssd_state_passing, for the case c_idx == c_off == 0
             # i.e., the very first sequence, we made states_ptr hold its inital state
@@ -248,7 +251,6 @@ def _chunk_scan_fwd_kernel(
                       other=0.0).to(tl.float32)
 
     # - handle chunk state limit
-    chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
     if HAS_INITSTATES:
 
         # have to split this if otherwise compilation will have problems
@@ -468,23 +470,26 @@ def _chunk_scan_fwd(cb,
             assert batch == 1, "chunk scan only supports initial states with batch 1"
             assert initial_states.shape == (seq_idx[0].max()+1, nheads, headdim, dstate)
 
-            # extra = 0
-            p = 0
-            chunk_indices, chunk_offsets = [], []
-            for i, idx in enumerate(seq_idx[0]):
-                o = i % chunk_size
-                c = idx > p
-                if o == 0 or c:
-                    # this means we have a change in sequence 
-                    # - that does not accur on the chunk boundary
-                    chunk_indices.append(i // chunk_size)
-                    chunk_offsets.append(o)
+            if initial_states.shape[0] == 1:
+                # no in this case no point to use initial states
+                initial_states = None
+            else:
+                p = 0
+                chunk_indices, chunk_offsets = [], []
+                for i, idx in enumerate(seq_idx[0]):
+                    o = i % chunk_size
+                    c = idx > p
+                    if o == 0 or c:
+                        # this means we have a change in sequence 
+                        # - that does not accur on the chunk boundary
+                        chunk_indices.append(i // chunk_size)
+                        chunk_offsets.append(o)
 
-                    if c:
-                        p = idx # new sequence
+                        if c:
+                            p = idx # new sequence
 
-            chunk_indices = torch.tensor(chunk_indices, dtype=torch.int, device=seq_idx.device)
-            chunk_offsets = torch.tensor(chunk_offsets, dtype=torch.int, device=seq_idx.device)
+                chunk_indices = torch.tensor(chunk_indices, dtype=torch.int, device=seq_idx.device)
+                chunk_offsets = torch.tensor(chunk_offsets, dtype=torch.int, device=seq_idx.device)
 
     # Allocates output.
     out = torch.empty(batch,
