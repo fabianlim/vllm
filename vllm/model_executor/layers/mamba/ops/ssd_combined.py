@@ -125,6 +125,12 @@ def _mamba_chunk_scan_combined_fwd(x,
     #   if the sequences are synced to the chunk boundaries.
     # - but in the case where there are offsets from the chunk boundaries
     #   we need to further update _chunk_scan_fwd (not yet done).
+
+    # if initial_states is not None:
+    #     torch.save(
+    #         (CB, x, dt, dA_cumsum, C, states, D, z, seq_idx, initial_states), 'debug2.pt'
+    #     )
+    #     import pdb; pdb.set_trace()
     out, out_x = _chunk_scan_fwd(
         CB,
         x,
@@ -141,9 +147,21 @@ def _mamba_chunk_scan_combined_fwd(x,
         return out, out_x, dt, dA_cumsum, states, final_states
     else:
         assert batch == 1, "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+        # if initial_states is not None:
+        #     torch.save((B, x, dt, dA_cumsum, cu_seqlens, states, initial_states), 'debug.pt')
+        #     import pdb; pdb.set_trace()
+
         varlen_states = chunk_state_varlen(B.squeeze(0), x.squeeze(0),
                                            dt.squeeze(0), dA_cumsum.squeeze(0),
-                                           cu_seqlens, states.squeeze(0))
+                                           cu_seqlens, states.squeeze(0),
+                                           initial_states=initial_states,
+                                           )
+
+        #torch.save((B, x, dt, dA_cumsum, cu_seqlens, states, initial_states), 'debug.pt')
+        # torch.save(
+        #     (CB, x, dt, dA_cumsum, C, states, D, z, seq_idx, initial_states), 'debug2.pt'
+        # )
+        # import pdb; pdb.set_trace()
         return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
 
 
