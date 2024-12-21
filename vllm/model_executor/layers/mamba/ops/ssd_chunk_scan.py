@@ -216,8 +216,10 @@ def _chunk_scan_fwd_kernel(
     chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch + c_idx * chunk_size * stride_seq_idx_seqlen
+
+        # - seq_idx_prev points to be previous (possibly logical) chunk.
         seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen,
-                            mask=c_idx >= 1,
+                            mask=pid_c>= 1,
                             other=0)
 
         # if there are init states, we only need seq_idx_m to point
@@ -231,7 +233,7 @@ def _chunk_scan_fwd_kernel(
                     seq_idx_ptr + (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen,
                 )
 
-                # - recall that in ssd_state_passing, for the case c_idx == c_off == 0
+                # - recall that in ssd_state_passing, for the case c_off == 0
                 # i.e., the very first sequence, we made states_ptr hold its inital state
                 # so this edge case is taken care of
                 if (
