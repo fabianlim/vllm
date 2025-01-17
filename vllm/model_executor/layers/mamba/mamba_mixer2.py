@@ -65,11 +65,40 @@ class Mixer2RMSNormGated(CustomOp):
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * x.to(input_dtype)
 
+    def forward_hf(
+        self,
+        hidden_states: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # put this to compare with HF implementation
+        # import pdb; pdb.set_trace()
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+
+        # before = hidden_states
+
+        if gate is not None:
+            hidden_states = hidden_states * nn.functional.silu(gate.to(torch.float32))
+
+        # torch.save((before, hidden_states), 'vllm.pt')
+
+        # problem is that even if hidden_states are mostly the same
+        # outliers will dominate the variance, and can be very sensitive
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+
+        out = self.weight * hidden_states.to(input_dtype)
+        return out
+
     def forward_cuda(
         self,
         x: torch.Tensor,
         gate: torch.Tensor,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
+        # hijack to HF impl
+        # out = self.forward_hf(x, gate)
+        # return out 
 
         if self.tp_size > 1:
             return self.forward_native(x, gate)
