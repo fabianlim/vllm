@@ -226,6 +226,9 @@ class Mamba2ForCausalLM(nn.Module, HasInnerState, IsAttentionFree):
             else:
                 self.max_batch_size = vllm_config.pad_for_cudagraph(
                     self.scheduler_config.max_num_seqs)
+        elif self.scheduler_config is not None:
+            # for eager just take the scheduler_config if avail
+            self.max_batch_size = self.scheduler_config.max_num_seqs
         else:
             self.max_batch_size = 8192 + 2
 
@@ -290,7 +293,7 @@ class Mamba2ForCausalLM(nn.Module, HasInnerState, IsAttentionFree):
         conv_dim = (intermediate_size + 2 * n_groups * self.config.state_size)
         conv_state_shape = (
             divide(conv_dim, world_size),
-            self.config.state_size - 1,
+            self.config.conv_kernel - 1,
         )
 
         # These are not TP-ed as they depend on A, dt_bias, D
