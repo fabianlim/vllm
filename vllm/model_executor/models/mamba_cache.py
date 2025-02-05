@@ -23,18 +23,19 @@ class MambaCacheParams:
 class MambaCacheManager:
 
     def __init__(self, dtype, num_mamba_layers, max_batch_size,
-                 conv_state_shape, temporal_state_shape):
+                 conv_state_shape, temporal_state_shape, device='cuda'):
 
         conv_state = torch.empty(size=(num_mamba_layers, max_batch_size) +
                                  conv_state_shape,
                                  dtype=dtype,
-                                 device="cuda")
+                                 device=device)
         temporal_state = torch.empty(size=(num_mamba_layers, max_batch_size) +
                                      temporal_state_shape,
                                      dtype=dtype,
-                                     device="cuda")
+                                     device=device)
 
         self.mamba_cache = (conv_state, temporal_state)
+        self.device = device
 
         # Maps between the request id and a dict that maps between the seq_id
         # and its index inside the self.mamba_cache
@@ -56,7 +57,7 @@ class MambaCacheManager:
 
             state_indices_tensor = torch.as_tensor(state_indices,
                                                    dtype=torch.int32,
-                                                   device="cuda")
+                                                   device=self.device)
             mamba_cache_tensors = self.mamba_cache
 
         else:
@@ -88,7 +89,7 @@ class MambaCacheManager:
         state_indices.extend([PAD_SLOT_ID] * cuda_graph_pad_len)
 
         input_state_indices_buffer.copy_(
-            torch.as_tensor(state_indices, dtype=torch.int32, device="cuda"))
+            torch.as_tensor(state_indices, dtype=torch.int32, device=self.device))
 
     def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
         """
@@ -98,7 +99,7 @@ class MambaCacheManager:
         """
         state_indices_tensor = torch.as_tensor([PAD_SLOT_ID] * batch_size,
                                                dtype=torch.int32,
-                                               device="cuda")
+                                               device=self.device)
         return (self.mamba_cache, state_indices_tensor)
 
     def _copy_mamba_cache(self, from_index: int, to_index: int):

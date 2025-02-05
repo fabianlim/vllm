@@ -475,7 +475,8 @@ class BambaForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
 
             self.mamba_cache = MambaCacheManager(
                 self.lm_head.weight.dtype, num_mamba_layers,
-                self.max_batch_size, *self._get_mamba_cache_shape())
+                self.max_batch_size, *self._get_mamba_cache_shape(), 
+                device=self.vllm_config.device_config.device)
         mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, mamba_cache_params,
