@@ -26,7 +26,8 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
 
     uses_ray: bool = False
 
-    def _check_cuda(self) -> None:
+    def _check_cuda(self, offset=1) -> None:
+    # def _check_cuda(self) -> None:
         """Check that the number of GPUs is sufficient for the parallel
         configuration. Separate from _init_executor to reduce the number of
         indented blocks.
@@ -34,6 +35,12 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         parallel_config = self.parallel_config
         world_size = parallel_config.world_size
         tensor_parallel_size = parallel_config.tensor_parallel_size
+
+        # offset = 0
+        # import pdb; pdb.set_trace()
+        # if self.device_config.device_type.count(':'): 
+        #     _, offset = self.device_config.device_type.split(':')
+        #     offset = int(offset)
 
         cuda_device_count = cuda_device_count_stateless()
         # Use confusing message for more common TP-only case.
@@ -48,10 +55,12 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
                 f"is less than than max local gpu count ({cuda_device_count})")
 
         # Set CUDA_VISIBLE_DEVICES for the driver, inherited by workers
-        if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        if "CUDA_VISIBLE_DEVICES" not in os.environ or offset > 0:
             update_environment_variables({
-                "CUDA_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))
+                "CUDA_VISIBLE_DEVICES": (",".join(map(str, range(offset, world_size+offset)))),
+                'WORLD_SIZE': str(world_size),
             })
+        
 
     def _init_executor(self) -> None:
 
@@ -86,7 +95,7 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
             self.worker_monitor = None
         else:
             result_handler = ResultHandler()
-            for rank in range(1, world_size):
+            for rank in range(0, world_size):
                 worker = ProcessWorkerWrapper(result_handler,
                                               WorkerWrapperBase,
                                               self.vllm_config, rank)
@@ -103,7 +112,8 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         # Set up signal handlers to shutdown the executor cleanly
         # sometimes gc does not work well
 
-        self.driver_worker = WorkerWrapperBase(self.vllm_config, 0)
+        # self.driver_worker = WorkerWrapperBase(self.vllm_config, 0)
+        self.driver_worker = self.workers[0]
 
         all_kwargs = []
         distributed_init_method = get_distributed_init_method(
@@ -125,7 +135,14 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)
-        self.driver_exec_model = make_async(self.driver_worker.execute_model)
+        # self.driver_exec_model = make_async(self.driver_worker.execute_model)
+
+        def exec_model(*args, **kwargs):
+            output = self.driver_worker.execute_method("execute_model", *args, **kwargs)
+            return output.get()
+
+        self.driver_exec_model = exec_model
+
         self.pp_locks: Optional[List[asyncio.Lock]] = None
 
     def shutdown(self):
@@ -182,12 +199,13 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
             for worker in self.workers
         ]
 
-        driver_worker_output = run_method(self.driver_worker, sent_method,
-                                          args, kwargs)
+        # driver_worker_output = run_method(self.driver_worker, sent_method,
+        #                                   args, kwargs)
 
         # Get the results of the workers.
-        return [driver_worker_output
-                ] + [output.get() for output in worker_outputs]
+        # return [driver_worker_output
+        #         ] + [output.get() for output in worker_outputs]
+        return [output.get() for output in worker_outputs]
 
     def check_health(self) -> None:
         """Raises an error if engine is unhealthy."""
