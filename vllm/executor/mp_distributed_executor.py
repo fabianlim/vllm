@@ -137,11 +137,11 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
                           max_parallel_loading_workers)
         # self.driver_exec_model = make_async(self.driver_worker.execute_model)
 
-        def exec_model(*args, **kwargs):
-            output = self.driver_worker.execute_method("execute_model", *args, **kwargs)
-            return output.get()
+        # def exec_model(*args, **kwargs):
+        #     output = self.driver_worker.execute_method("execute_model", *args, **kwargs)
+        #     return output.get()
 
-        self.driver_exec_model = exec_model
+        # self.driver_exec_model = exec_model
 
         self.pp_locks: Optional[List[asyncio.Lock]] = None
 
@@ -158,7 +158,11 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         Passing None will cause the driver to stop the model execution
         loop running in each of the remote workers.
         """
-        return self.driver_worker.execute_model(execute_model_req)
+        # return self.driver_worker.execute_model(execute_model_req)
+        output = self.driver_worker.execute_method(
+            "execute_model", execute_model_req)
+        return output.get()
+
 
     def _run_workers(
         self,
