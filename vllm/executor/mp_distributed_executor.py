@@ -35,6 +35,14 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         world_size = parallel_config.world_size
         tensor_parallel_size = parallel_config.tensor_parallel_size
 
+        offset = os.environ.get(
+            "VLLM_WORKER_MULTIPROC_DEVICE_OFFSET",
+            0
+        )
+        offset = int(offset)
+
+        self.driver_worker_diff_process = offset > 0
+
         cuda_device_count = cuda_device_count_stateless()
         # Use confusing message for more common TP-only case.
         if tensor_parallel_size > cuda_device_count:
@@ -48,10 +56,12 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
                 f"is less than than max local gpu count ({cuda_device_count})")
 
         # Set CUDA_VISIBLE_DEVICES for the driver, inherited by workers
-        if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        if "CUDA_VISIBLE_DEVICES" not in os.environ or offset > 0:
             update_environment_variables({
-                "CUDA_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))
+                "CUDA_VISIBLE_DEVICES": (",".join(map(str, range(offset, world_size+offset)))),
+                'WORLD_SIZE': str(world_size),
             })
+        
 
     def _init_executor(self) -> None:
 
@@ -86,7 +96,9 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
             self.worker_monitor = None
         else:
             result_handler = ResultHandler()
-            for rank in range(1, world_size):
+            for rank in range(
+                1 if not self.driver_worker_diff_process else 0, world_size
+            ):
                 worker = ProcessWorkerWrapper(result_handler,
                                               WorkerWrapperBase,
                                               self.vllm_config, rank)
@@ -103,7 +115,10 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         # Set up signal handlers to shutdown the executor cleanly
         # sometimes gc does not work well
 
-        self.driver_worker = WorkerWrapperBase(self.vllm_config, 0)
+        if not self.driver_worker_diff_process:
+            self.driver_worker = WorkerWrapperBase(self.vllm_config, 0)
+        else:
+            self.driver_worker = self.workers[0]
 
         all_kwargs = []
         distributed_init_method = get_distributed_init_method(
@@ -125,7 +140,10 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)
-        self.driver_exec_model = make_async(self.driver_worker.execute_model)
+
+        if not self.driver_worker_diff_process:
+            # NOTE: is this even used?
+            self.driver_exec_model = make_async(self.driver_worker.execute_model)
         self.pp_locks: Optional[List[asyncio.Lock]] = None
 
     def shutdown(self):
@@ -141,7 +159,19 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         Passing None will cause the driver to stop the model execution
         loop running in each of the remote workers.
         """
-        return self.driver_worker.execute_model(execute_model_req)
+        if not self.driver_worker_diff_process:
+            return self.driver_worker.execute_model(execute_model_req)
+
+        # is in a process
+        if execute_model_req is not None:
+            # NOTE: not sure what this is, but it will cause a pickling error if the driver worker
+            execute_model_req.async_callback = None
+
+        output = self.driver_worker.execute_method(
+            "execute_model", execute_model_req)
+
+        return output.get()
+
 
     def _run_workers(
         self,
@@ -181,6 +211,11 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
             worker.execute_method(sent_method, *args, **kwargs)
             for worker in self.workers
         ]
+
+        # handle 
+        if self.driver_worker_diff_process:
+            # Run only non-driver workers and just return futures.
+            return [output.get() for output in worker_outputs]
 
         driver_worker_output = run_method(self.driver_worker, sent_method,
                                           args, kwargs)
