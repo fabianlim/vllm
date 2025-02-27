@@ -858,7 +858,9 @@ def init_distributed_environment(
         world_size = torch.distributed.get_world_size()
         world_size_actual = config.parallel_config.world_size_across_dp
 
-        assert world_size_actual < world_size, "Need to increase world_size"
+        assert world_size % world_size_actual == 0, (
+            f"DP*PP*TP={world_size_actual} needs to divide world size={world_size}"
+        )
         ranks = [
             list(range(i*world_size_actual, (i+1)*world_size_actual)) 
             for i in range(world_size // world_size_actual )
