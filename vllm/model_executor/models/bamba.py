@@ -171,14 +171,16 @@ class BambaAttentionDecoderLayer(nn.Module):
         else:
             rotary_dim = self.head_dim  # default
 
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            rotary_dim=rotary_dim,
-            max_position=max_position_embeddings,
-            rope_scaling=rope_scaling,
-            base=rope_theta,
-            is_neox_style=True,
-            dtype=torch.get_default_dtype(),  # see impl of get_rope
+        self.rotary_emb = (
+            get_rope(
+                head_size=self.head_dim,
+                rotary_dim=rotary_dim,
+                max_position=max_position_embeddings,
+                rope_scaling=rope_scaling,
+                base=rope_theta,
+                is_neox_style=True,
+                dtype=torch.get_default_dtype(),  # see impl of get_rope
+            ) if rotary_dim > 0 else None
         )
 
         self.qkv_proj = QKVParallelLinear(
@@ -218,7 +220,8 @@ class BambaAttentionDecoderLayer(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self.rotary_emb(positions, q, k)
+        if self.rotary_emb:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
